@@ -1,4 +1,4 @@
-# agent-skills-pipeline
+# EDB Agent Skills
 
 Distribution registry for compiled EDB Agent Skill artifacts. Skills published here are consumed by customer-deployed agentic systems (e.g., Claude) to interact with EDB products.
 
