@@ -2,9 +2,9 @@
   "skills": {
     "aidb": {
       "repo_shas": {
-        "git@github.com:EnterpriseDB/aidb.git": "df5630010933f1ebc297ea47fca750f967aae38c"
+        "git@github.com:EnterpriseDB/aidb.git": "716b1c93ca74043f09aa2718b6028bc2a443f927"
       },
-      "built_at": "1777665833Z"
+      "built_at": "1788803368Z"
     }
   }
 }
