@@ -1,401 +1,405 @@
 ---
 name: aidb
-description: >
-  Skill for operating AIDB — a PostgreSQL extension (EDB Postgres AI / AI Factory) that brings
-  native AI capabilities into Postgres entirely through SQL. Use this skill when a user needs to:
-  register AI models; create, run, or manage data-transformation pipelines (chunking, OCR, PDF
-  parsing, HTML parsing, summarization, or vector embedding); build a Semantic Knowledge Base
-  for natural-language schema discovery (text-to-SQL); define and execute Semantic Aliases
-  (parameterized agent-callable SQL queries); manage object-storage volumes; or call standalone
-  AI functions (encode_text, rerank_text, parse_pdf, etc.). Supports PostgreSQL 14–18. All
-  operations are SQL-only. No Python SDK or REST API exists; the agent must connect to PostgreSQL
-  and issue SQL statements.
+description: Operate EDB Postgres AI's AIDB extension (AI Accelerator Pipelines, part of AI Factory) entirely through SQL. Use when a user asks to build RAG or embedding pipelines in PostgreSQL, register AI models (local, OpenAI-compatible, NIM, Gemini, OpenRouter), chunk/summarize/parse/OCR text, run vector retrieval, build a Semantic Knowledge Base or Semantic Aliases for text-to-SQL, ingest from object-storage volumes, or troubleshoot pipeline errors, background workers, model credentials and auto-processing modes. Triggers on "aidb", "ai-factory", "EDB Postgres AI", "aidb.create_pipeline", "knowledge base", "retrieve_text", "semantic kb".
 metadata:
-  aliases:
-    - aidb
-    - ai-factory
-  version: "7.4.0"
-  edb_product: EDB Postgres AI — AI Accelerator Pipelines
-  postgres_versions: "14, 15, 16, 17, 18"
-  schema: aidb
-  sovereign_ai: true
+  aliases: [aidb, ai-factory]
+  product: EDB Postgres AI — AI Accelerator (AIDB)
+  interface: SQL (schema `aidb`)
+  supported_postgres: "14–18"
+  docs: https://www.enterprisedb.com/docs/aidb/latest/
 ---
 
-# AIDB Agent Skill
+# AIDB — AI Accelerator Pipelines inside PostgreSQL
 
-AIDB is a PostgreSQL extension that adds native AI capabilities — embeddings, vector search,
-document parsing, OCR, summarization, and schema-aware intelligence — all via SQL in the
-`aidb` schema. This skill teaches you exactly how to use it.
+AIDB is a PostgreSQL extension. **Everything is SQL functions in the `aidb` schema.** There is
+no CLI, no REST API to call, no Python SDK required. You help the user by writing and running
+SQL against their database.
 
-**Key principle**: Every operation is a SQL function call. Connect to PostgreSQL and run SQL.
+Five capability areas (this is the whole supported surface):
+
+1. **Pipelines** — source (table or volume) → ordered AI steps → destination table.
+2. **Models** — register once by name, reuse everywhere.
+3. **Standalone AI functions** — embed, generate, rerank, chunk, summarize, parse HTML/PDF, OCR.
+4. **Semantic Knowledge Base** — embeds a schema's metadata for natural-language schema search.
+5. **Semantic Aliases** — named parameterized SQL, discoverable by semantic search.
 
 ---
 
-## 1. Quick-Start Checklist
+## Safety rules — read before running anything
 
-Before operating AIDB, verify the environment:
+1. **Probe before you propose.** Run Step 0. Provider lists, view names, GUCs and installed
+   versions differ per build.
+2. **Never echo secrets.** Use `credentials => jsonb_build_object('api_key', current_setting('my.key'))`
+   or `credentials_env => 'MY_API_KEY'`. Never paste a key into the transcript or into `config`.
+3. **Never invent a function, provider, option key, view name or numeric limit.** If you are not
+   sure it exists in this build, discover it (`\df aidb.*`, `\dv aidb.*`, `SELECT * FROM aidb.model_providers;`)
+   or read `references/function-reference.md`. If the product rejects something, **quote its error
+   message verbatim** — AIDB errors state the exact limit and the remedy.
+4. **Confirm destructive actions explicitly** (see "Destructive operations" below).
+5. **Backfill before automating.** Create pipelines with `auto_processing => 'Disabled'`, run once,
+   verify, then switch to `Background`.
+6. **One statement at a time when it matters.** `create_model` and `create_pipeline` roll back on
+   failure; do not bundle them with unrelated DDL.
+
+---
+
+## Step 0 — environment probe (READ-ONLY, run first)
+
+Save as a file and run `psql -X -v ON_ERROR_STOP=0 -P pager=off -f probe.sql`, or paste into psql.
+A section that errors *is* the answer (e.g. `schema "aidb" does not exist` ⇒ not installed).
 
 ```sql
--- 1. Confirm extension is installed
-SELECT name, installed_version FROM pg_available_extensions WHERE name = 'aidb';
+-- 0. server version: AIDB supports PostgreSQL 14–18
+SELECT current_database(), current_user, version(),
+       current_setting('server_version_num')::int AS version_num;
 
--- 2. Install if missing (needs shared_preload_libraries='aidb' in postgresql.conf + restart first)
-CREATE EXTENSION IF NOT EXISTS aidb CASCADE;
+-- 1. extensions
+SELECT extname, extversion FROM pg_extension
+WHERE extname IN ('aidb','vector','pgfs','vchord') ORDER BY extname;
 
--- 3. Verify models, pipelines, KBs
-SELECT * FROM aidb.list_models();
-SELECT * FROM aidb.list_pipelines();
+-- 2. background workers need 'aidb' preloaded (restart to change)
+SHOW shared_preload_libraries;
+
+-- 3. runtime config (pending_restart = t means "set but not active")
+SELECT name, setting, unit, context, pending_restart
+FROM pg_settings WHERE name LIKE 'aidb.%' OR name LIKE 'pgfs.%' ORDER BY name;
+
+-- 4. providers compiled into THIS build — never assume
+SELECT server_name, server_description FROM aidb.model_providers ORDER BY server_name;
+
+-- 5. what objects/functions this build actually exposes (views are version-suffixed)
+SELECT c.relname, c.relkind FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+WHERE n.nspname = 'aidb' AND c.relkind IN ('r','v','m') ORDER BY 2,1;     -- psql: \dv aidb.*
+SELECT p.proname, pg_get_function_identity_arguments(p.oid)
+FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+WHERE n.nspname = 'aidb' ORDER BY 1,2;                                    -- psql: \df aidb.*
+
+-- 6. inventory
+SELECT name, provider FROM aidb.models ORDER BY name;
+SELECT name, source, destination, auto_processing FROM aidb.pipelines_v7 ORDER BY name;
+SELECT * FROM aidb.get_all_error_summaries();
 SELECT * FROM aidb.list_semantic_kbs();
+SELECT * FROM aidb.list_volumes();
+
+-- 7. may the current role use AIDB?
+SELECT current_user, pg_has_role(current_user, 'aidb_users', 'MEMBER') AS in_aidb_users;
 ```
 
-If `aidb` is not available in `pg_available_extensions`, the extension package is not installed on
-this PostgreSQL instance. Escalate to the database administrator.
+**Interpretation** (full table: `references/step-operations.md`, "Operations runbook"):
 
----
-
-## 2. Core Concepts
-
-| Concept | Description |
+| Observation | Meaning / next action |
 |---|---|
-| **Model** | A named AI model registered with a provider and optional credentials. Referenced by name everywhere. |
-| **Pipeline** | Source table → ordered transformation steps → destination table. Runs on data change or manually. |
-| **Step** | One transformation unit within a pipeline (e.g., `ChunkText`, `KnowledgeBase`, `ParsePdf`). |
-| **Semantic KB** | Vectorized index of PostgreSQL schema metadata. Enables natural language schema discovery. |
-| **Semantic Alias** | Named SQL query with NL description and parameters, discoverable by agents via semantic search. |
-| **Volume** | Object-storage mount (S3/GCS/Azure/local) for file-based pipeline sources. |
+| `version_num` < 140000 or ≥ 190000 | AIDB documents support for **PostgreSQL 14–18**. Warn the user before doing anything else. |
+| no `aidb` row in §1 | Ask, then `CREATE EXTENSION IF NOT EXISTS aidb CASCADE;` (`CASCADE` pulls in pgvector) |
+| `aidb` present, `vector` absent | CASCADE was skipped — `KnowledgeBase` steps will fail |
+| `aidb` not in `shared_preload_libraries` | `Background` mode never advances; use `aidb.run_pipeline()` until an admin adds it **and restarts** |
+| `pending_restart = t` on `aidb.max_threads` | new value not in effect yet |
+| desired provider missing from §4 | pick another; `create_model` would fail with `Model provider with name "X" not found` |
+| §5 has no `pipeline_metrics_v7` | this build names its views differently — use the §5 list, and `SELECT * FROM aidb.get_pipeline_metrics('<pipeline>');` |
+| `in_aidb_users = f` and not superuser | ask an admin for `GRANT aidb_users TO <role>;` |
 
 ---
 
-## 3. Model Registration
+## Mental model
 
-Models must be registered once and are then referenced by name.
+* A **pipeline** = `source` → `step_1..step_N` → `destination` table.
+* Destination columns are always `id`, `source_id`, `part_ids`, and the payload column named
+  **`value`** (TEXT, BYTEA, or `VECTOR(n)` depending on the terminal step).
+* **Auto-processing modes:**
+
+| Mode | Mechanism | Blocks writers? | Use when |
+|---|---|---|---|
+| `Live` | row triggers on the source table | yes — inference inside the write txn | low write volume, freshness matters |
+| `Background` | worker drains in `batch_size` batches every `background_sync_interval` | no | production ingest, bulk loads |
+| `Disabled` (default) | nothing until `aidb.run_pipeline()` | no | ETL / manual control |
+
+* **Argument-order rule:** model-invoking functions take the **model name first**
+  (`aidb.encode_text('m','text')`); data-prep functions take the **payload first** with an
+  `options` bag second (`aidb.chunk_text('text', '{...}')`). When unsure, use named arguments.
+* **JSON typing rule:** `step_N_options` is **jsonb** (config helpers return jsonb → no cast).
+  Standalone data-prep functions take **json** — pass a quoted JSON literal, or cast a helper:
+  `aidb.summarize_text_config('llm')::json`. Do **not** write `::jsonb` there.
+
+---
+
+## Workflow A — install / verify
 
 ```sql
--- Local model (no external API)
-SELECT aidb.create_model('my_bert', 'bert_local',
-    config => '{"model": "/path/to/bert-weights"}'::JSONB);
+CREATE EXTENSION IF NOT EXISTS aidb CASCADE;   -- requires pgvector; CASCADE installs it
+SELECT extname, extversion FROM pg_extension WHERE extname = 'aidb';
+SELECT * FROM aidb.model_providers ORDER BY server_name;
+```
 
--- OpenAI embeddings
-SELECT aidb.create_model('my_embed', 'openai_embeddings',
-    config => aidb.embeddings_config(model => 'text-embedding-3-small', api_key => 'sk-...'));
+Ask before creating an extension. If the user needs `Background` pipelines, `aidb` must be in
+`shared_preload_libraries` (DBA + restart).
 
--- OpenAI completions
-SELECT aidb.create_model('my_llm', 'openai_completions',
-    config => aidb.completions_config(model => 'gpt-4o-mini', api_key => 'sk-...'));
+## Workflow B — register a model
 
--- Generic OpenAI-compatible endpoint (e.g. vLLM, Ollama)
-SELECT aidb.create_model('local_llm', 'completions',
-    config => aidb.completions_config(
-        model => 'mistral-7b',
-        url   => 'http://vllm-host:8000/v1/chat/completions'));
+```sql
+-- local, no network, no credentials (Sovereign-AI default)
+SELECT aidb.create_model('embed_model', 'bert_local');
 
--- Testing (no external service — deterministic output)
-SELECT aidb.create_model('test_model', 'dummy');
+-- remote, OpenAI-compatible
+SELECT aidb.create_model(
+    'openai_embed', 'openai_embeddings',
+    config      => aidb.embeddings_config(model => 'text-embedding-3-small'),
+    credentials => jsonb_build_object('api_key', current_setting('my.openai_key')));
 
--- List models (credentials never returned)
+SELECT aidb.validate_model('openai_embed');
 SELECT * FROM aidb.list_models();
 ```
 
-> **Security**: Credentials are stored in `pg_user_mappings`, never in plain-text catalog tables.
-> `aidb.list_models()` and `aidb.get_model()` never return credential fields.
+* `validate => true` (the default) **probes the endpoint at model-registration time**; on failure
+  the whole transaction rolls back and the error hints at `validate => false`.
+* `config` is cleartext: `create_model` raises if it contains `api_key`/`basic_auth` at any depth.
+* Credentials attach to the **provider server**, shared by all models on it → a second model with
+  new credentials needs `replace_credentials => true`, and `delete_model` drops that shared mapping.
+* Provider catalogue and capability→consumer map: `references/model-adapters.md`.
 
-See [references/model-adapters.md](references/model-adapters.md) for all supported providers.
-
----
-
-## 4. Pipeline Creation
-
-### 4.1 Basic text-to-embeddings pipeline
+## Workflow C — standalone AI functions
 
 ```sql
--- Source table must already exist; destination must NOT exist
-CREATE TABLE documents (id SERIAL PRIMARY KEY, content TEXT NOT NULL);
+-- embeddings (returns real[]; cast to vector for pgvector operators)
+SELECT array_length(aidb.encode_text('embed_model', 'hello world'), 1);
 
+-- completions
+SELECT aidb.generate_text('my_llm', 'Summarize: ...',
+         aidb.inference_config(temperature => 0.2, max_tokens => 64)::json);
+
+-- reranking (returns text, logit_score, id)
+SELECT text, logit_score
+FROM aidb.rerank_text('my_reranker', 'capital of France',
+                      ARRAY['Paris is the capital of France.','Bananas are yellow.'])
+ORDER BY logit_score DESC;
+
+-- chunking one string: set-returning, columns (part_id, chunk)
+SELECT * FROM aidb.chunk_text('long text...', '{"desired_length":512,"overlap_length":64}');
+
+-- chunking a whole table: LATERAL, one row per chunk
+SELECT d.id, c.part_id, c.chunk
+FROM docs d,
+     LATERAL aidb.chunk_text(d.body, '{"desired_length":512,"overlap_length":64}') AS c;
+
+-- summarize a column (scalar function; options must contain "model")
+SELECT d.id, aidb.summarize_text(d.body, aidb.summarize_text_config('my_llm')::json)
+FROM docs d;
+
+-- parsing / OCR
+SELECT aidb.parse_html('<h1>Hi</h1>', '{"method":"StructuredMarkdown"}');
+SELECT * FROM aidb.parse_pdf(pg_read_binary_file('/tmp/doc.pdf')::bytea);
+SELECT * FROM aidb.perform_ocr(img_bytes, '{"model":"my_ocr"}');
+```
+
+For a durable, incremental version of any of these, use a pipeline instead (Workflow D).
+
+## Workflow D — build a RAG pipeline
+
+```sql
+-- 1. create (destination MUST NOT already exist)
 SELECT aidb.create_pipeline(
-    name               => 'doc_embeddings',        -- max 46 chars
-    source             => 'documents',
+    name               => 'docs_kb',
+    source             => 'public.documents',
     source_key_column  => 'id',
-    source_data_column => 'content',
-    auto_processing    => 'Background',            -- 'Live' | 'Background' | 'Disabled'
-    step_1             => 'KnowledgeBase',
-    step_1_options     => aidb.knowledge_base_config(
-        model             => 'my_embed',
-        data_format       => 'Text',
-        distance_operator => 'Cosine',             -- 'L2' | 'Cosine' | 'InnerProduct'
-        vector_index      => aidb.vector_index_hnsw_config(m => 16, ef_construction => 64)
-    )
-);
+    source_data_column => 'body',
+    destination        => 'documents_vectors',
+    auto_processing    => 'Disabled',              -- backfill first
+    step_1             => 'ChunkText',
+    step_1_options     => aidb.chunk_text_config(desired_length => 600, overlap_length => 80),
+    step_2             => 'KnowledgeBase',
+    step_2_options     => aidb.knowledge_base_config(
+                              model             => 'embed_model',
+                              data_format       => 'Text',
+                              distance_operator => 'Cosine'));
+
+-- 2. backfill
+SELECT aidb.run_pipeline('docs_kb');
+
+-- 3. verify: progress, then quality
+SELECT * FROM aidb.get_pipeline_metrics('docs_kb');
+SELECT * FROM aidb.get_error_log_summary('docs_kb');
+SELECT key, value, distance FROM aidb.retrieve_text('docs_kb', 'your question here', 5);
+
+-- 4. automate only after a clean backfill
+SELECT aidb.update_pipeline('docs_kb', auto_processing => 'Background',
+                            batch_size => 100, background_sync_interval => '1 minute');
 ```
 
-### 4.2 Multi-step: PDF → images → OCR → chunks → embeddings
+Manual similarity search (payload column is `value`):
 
 ```sql
-SELECT aidb.create_pipeline(
-    name               => 'pdf_ocr_embed',
-    source             => 'pdf_docs',
-    source_key_column  => 'id',
-    source_data_column => 'content',               -- BYTEA column
-    auto_processing    => 'Background',
-    step_1             => 'PdfToImage',
-    step_1_options     => '{"dpi": 300, "format": {"type": "png"}, "render_annotations": true}'::JSONB,
-    step_2             => 'PerformOcr',
-    step_2_options     => aidb.ocr_config('my_ocr_model'),
-    step_3             => 'ChunkText',
-    step_3_options     => aidb.chunk_text_config(desired_length => 512, overlap_length => 64),
-    step_4             => 'KnowledgeBase',
-    step_4_options     => aidb.knowledge_base_config(model => 'my_embed', data_format => 'Text')
-);
-```
-
-### 4.3 Auto-processing modes
-
-| Mode | Behavior |
-|---|---|
-| `Live` | Triggers synchronously on every INSERT/UPDATE (low-latency, use for small volumes) |
-| `Background` | Async worker batches new rows (high-volume, non-blocking) |
-| `Disabled` | Manual trigger only via `aidb.run_pipeline()` |
-
-### 4.4 Run, update, delete
-
-```sql
--- Run manually (works for any mode; force_sync reruns all rows)
-SELECT aidb.run_pipeline('doc_embeddings');
-SELECT aidb.run_pipeline('doc_embeddings', force_sync => TRUE);
-
--- Change auto_processing mode
-SELECT aidb.update_pipeline('doc_embeddings', auto_processing => 'Live');
-
--- Delete pipeline (cascade => TRUE also drops destination table)
-SELECT aidb.delete_pipeline('doc_embeddings', cascade => FALSE);
-```
-
-See [references/step-operations.md](references/step-operations.md) for all step types, their
-input/output types, config helpers, and valid sequencing rules.
-
----
-
-## 5. Semantic Search (After Pipeline Runs)
-
-```sql
--- Destination table is named: pipeline_<pipeline_name>
--- Use pgvector distance operators based on distance_operator configured:
---   Cosine  →  <=>
---   L2      →  <->
---   InnerProduct → <#>
-
 SELECT source_id
-FROM pipeline_doc_embeddings
-ORDER BY embedding <=> aidb.encode_text_query('find payment policies', 'my_embed')
+FROM documents_vectors
+ORDER BY value <=> aidb.kb_query_encode('docs_kb', 'search text')::vector
 LIMIT 10;
 ```
 
----
+Canonical step chains (details + templates: `references/step-operations.md`):
 
-## 6. Semantic Knowledge Base
+* HTML → RAG: `ParseHtml` → `ChunkText` → `KnowledgeBase`
+* Digital PDF → RAG: `ParsePdf` → `ChunkText` → `KnowledgeBase`
+* Scanned PDF → RAG: `PdfToImage` → `PerformOcr` → `ChunkText` → `KnowledgeBase`
+* Long docs → short index: `ChunkText` → `SummarizeText` → `KnowledgeBase`
 
-```sql
--- Create a KB over one or more schemas
-SELECT aidb.create_semantic_kb(
-    name            => 'app_schema_kb',
-    model           => 'my_embed',
-    schemas         => ARRAY['public', 'analytics'],
-    auto_processing => 'Background'
-);
+`KnowledgeBase` must be the **terminal** step. Envelope types (`Text`/`Bytes`/`Vector`) must match
+between consecutive steps; mismatches are rejected at creation time.
 
--- Refresh after schema changes
-SELECT aidb.refresh_semantic_kb('app_schema_kb');
+## Workflow E — diagnose a pipeline (READ-ONLY)
 
--- Search: find relevant tables
-SELECT schema_name, relation_name, similarity
-FROM aidb.get_tables('app_schema_kb', 'customer order history', 0.7, 5, 0);
-
--- Search: find relevant columns
-SELECT schema_name, relation_name, column_name, similarity
-FROM aidb.get_columns('app_schema_kb', 'user email address', 0.7, 10, 0);
-
--- Full metadata search
-SELECT schema_name, relation_name, column_name, entity_type, definition, similarity
-FROM aidb.get_metadata('app_schema_kb', 'invoice total amount', 0.6, 10, 0);
-```
-
-**Similarity threshold guidance**: 0.9+ = near-exact; 0.8 = good default; 0.5–0.7 = exploration.
-
----
-
-## 7. Semantic Aliases
+Set the name once, run top to bottom, **stop at the first section that explains the symptom**.
 
 ```sql
--- Register a named, agent-callable query
-SELECT aidb.create_semantic_alias(
-    name        => 'monthly_sales_by_region',
-    description => 'Total sales by region for a given calendar month',
-    query_text  => $$
-        SELECT region, SUM(amount) AS total_sales
-        FROM sales
-        WHERE date_trunc('month', sale_date) = date_trunc('month', ${target_month}::DATE)
-        GROUP BY region ORDER BY total_sales DESC
-    $$,
-    params      => aidb.alias_params(
-        aidb.alias_param('target_month', 'TEXT', 'Month to aggregate, e.g. 2024-01-01')
-    ),
-    model       => 'my_embed'
-);
+\set p 'my_pipeline'
 
--- Discover aliases via natural language
-SELECT name, description, similarity
-FROM aidb.search_semantic_aliases('my_embed', 'sales by geography last month', 0.6, 5, 0);
+-- 1. definition: source, destination, steps, mode, owner_role
+SELECT * FROM aidb.pipelines_v7 WHERE name = :'p';
 
--- Execute an alias
-SELECT * FROM aidb.execute_semantic_alias(
-    'monthly_sales_by_region',
-    '{"target_month": "2024-01-01"}'::JSONB
-);
+-- 2. progress + error counters
+SELECT * FROM aidb.get_pipeline_metrics(:'p');
+
+-- 3. errors by step / operation / category
+SELECT * FROM aidb.get_error_log_summary(:'p');
+
+-- 4. the 25 most recent errors  (QUOTE error_message BACK VERBATIM)
+SELECT id, source_id, pipeline_step, step_operation, error_category,
+       left(error_message, 300) AS error_message, retry_count, last_seen_at
+FROM aidb.get_error_logs(:'p', p_limit => 25);
+
+-- 5. do the models referenced by the steps still exist?
+SELECT s.step_order, s.operation, s.options->>'model' AS step_model,
+       (m.name IS NOT NULL) AS model_exists
+FROM aidb.pipelines_v7 p
+CROSS JOIN LATERAL jsonb_to_recordset(p.steps)
+     AS s(step_order int, operation text, options jsonb)
+LEFT JOIN aidb.models m ON m.name = s.options->>'model'
+WHERE p.name = :'p' ORDER BY s.step_order;
+
+-- 6. background worker alive? (only matters in Background mode)
+SHOW shared_preload_libraries;
+SELECT pid, backend_type, state, wait_event_type, wait_event
+FROM pg_stat_activity
+WHERE backend_type ILIKE '%aidb%' OR application_name ILIKE '%aidb%';
+
+-- 7. runtime state
+SELECT * FROM aidb.pipeline_runtime_state WHERE name = :'p';
 ```
 
----
+Reading it:
 
-## 8. Standalone AI Functions
+| Reading | Conclusion | Action |
+|---|---|---|
+| blocking-error count > 0 | pipeline-level failure halts everything | §4, fix the cause, re-run |
+| unprocessed > 0, destination = 0 | nothing has run | `Disabled` ⇒ `run_pipeline()`; `Background` ⇒ §6 |
+| unprocessed = 0, destination = 0 | no eligible rows, or every row errored | §4 |
+| destination growing | healthy | check quality with `aidb.retrieve_text(...)` |
+| `last_run_completed` NULL (§7) | never completed a run | as above |
 
-These do NOT require a pipeline — call them directly in any SQL query.
+`source_id IS NULL` ⇒ **blocking** error (model / credentials / permission) — never requeued.
+`source_id NOT NULL` ⇒ record-level, eligible for requeue:
 
 ```sql
--- Text embedding (single and batch)
-SELECT aidb.encode_text('Hello world', 'my_embed');
-SELECT aidb.encode_text_batch(ARRAY['doc 1', 'doc 2'], 'my_embed');
-SELECT aidb.encode_text_query('search query', 'my_embed');  -- query-side for bi-encoders
-
--- Image embedding
-SELECT aidb.encode_image(image_bytes_col, 'my_clip_model');
-
--- Semantic reranking
-SELECT index, score FROM aidb.rerank_text('query', ARRAY['cand1','cand2'], 'my_rerank_model')
-ORDER BY score DESC;
-
--- Text chunking
-SELECT part_id, value FROM aidb.chunk_text(
-    'Long text...', aidb.chunk_text_config(desired_length => 512, overlap_length => 64));
-
--- Summarization
-SELECT aidb.summarize_text('Long doc...', aidb.summarize_text_config(model => 'my_llm'));
-
--- Document parsing
-SELECT aidb.parse_html(html_bytes, aidb.html_parse_config());
-SELECT aidb.parse_pdf(pdf_bytes, aidb.pdf_parse_config(method => 'Structured'));
-
--- OCR
-SELECT aidb.perform_ocr(image_bytes, 'my_ocr_model');
+SELECT * FROM aidb.requeue_pipeline_errors('my_pipeline', ARRAY[1,2,3]::bigint[]);
+SELECT aidb.run_pipeline('my_pipeline');       -- Background drains by itself
+SELECT * FROM aidb.get_error_log_summary('my_pipeline');
 ```
 
----
+Symptom→cause→fix matrix: `references/step-operations.md`, "Operations runbook".
 
-## 9. Volume Management
+## Workflow F — Semantic KB and text-to-SQL
 
 ```sql
--- Create a local-disk volume
-SELECT aidb.create_volume(
-    name             => 'my_local_vol',
-    storage_location => 'local',
-    path             => '/data/documents',
-    data_type        => 'Text'          -- 'Text' | 'Bytes' | 'Image'
-);
-
--- List, read, write, delete files
-SELECT * FROM aidb.list_volumes();
-SELECT aidb.list_volume_content('my_local_vol');
-SELECT aidb.read_volume_file('my_local_vol', 'report.txt');
-SELECT aidb.write_volume_data('my_local_vol', 'output.txt', 'content'::BYTEA);
-SELECT aidb.delete_volume_file('my_local_vol', 'old.txt');
-SELECT aidb.delete_volume('my_local_vol');
+SELECT aidb.create_semantic_kb('shop_kb', 'embed_model', ARRAY['shop'],
+                               auto_processing => 'Background');
+SELECT aidb.semantic_kb_stats('shop_kb');
+SELECT * FROM aidb.semantic_kb_search('which table has customer spend?', 'shop_kb', top_k => 10);
 ```
 
----
+* A Semantic KB embeds table/column names **and `COMMENT ON` text** — an uncommented schema
+  embeds only identifiers. Advise the user to comment their schema.
+* Loop: `semantic_kb_search` → if a high-scoring **alias** hit, `aidb.execute_semantic_alias(...)`
+  and stop (curated beats generated) → else `get_entity_definitions` + `get_column_definitions`
+  → generate SQL from those definitions only → show it to the user → run it read-only.
+* Semantic-KB pipelines have an empty source and therefore **no error table**; use PostgreSQL
+  logs and `aidb.semantic_kb_stats()`.
+* Alias `${param}` placeholders bind as positional parameters — argument values cannot inject SQL.
 
-## 10. Runtime Configuration
+## Workflow G — object-storage sources (volumes)
 
 ```sql
--- View current GUC settings
-SHOW aidb.max_threads;               -- CPU thread pool for local inference
-SHOW aidb.pipeline_error_warnings;   -- Emit per-error WARNING to PG log
-
--- Change settings
-ALTER SYSTEM SET aidb.max_threads = 8;          -- REQUIRES PG RESTART
-ALTER SYSTEM SET aidb.pipeline_error_warnings = true;
-SELECT pg_reload_conf();                         -- Only needed for pipeline_error_warnings
+SELECT pgfs.create_storage_location('docs_bucket', 's3://my-bucket',
+                                    options => '{"region":"eu-central-1"}');
+SELECT aidb.create_volume('docs_volume', 'docs_bucket', 'corpus/', 'Pdf');
+SELECT * FROM aidb.list_volume_content('docs_volume');   -- prove connectivity FIRST
 ```
 
-> **Important**: `aidb.max_threads` changes require a full PostgreSQL restart, not just `pg_reload_conf()`.
+Volume-sourced pipelines omit `source_key_column`/`source_data_column`; `source_id` becomes the
+file path. Volume names must be valid unquoted identifiers (no hyphens). For `file://` locations,
+`pgfs.allowed_local_fs_paths` must include the path.
 
 ---
 
-## 11. Key Constraints to Remember
+## Constraints and gotchas (state these qualitatively; let the product supply exact values)
 
-- **Pipeline name max length**: 46 characters
-- **Max steps per pipeline**: 10
-- **Destination table must not exist** at pipeline creation time
-- **Step sequencing**: output type of step N must match input type of step N+1; validated at creation
-- **`KnowledgeBase` and `SemanticKB` must be the last step** in a pipeline (output type is Vector)
-- **Model validation** happens at pipeline creation time, not at execution time
-- **`aidb.max_threads` changes require a DB restart**
+* **Pipeline names are length-limited** and **the number of steps is capped**, because AIDB derives
+  helper object names from the pipeline name. Keep names short `snake_case`. If rejected, quote the
+  error — it states the exact maximum for this build. Build-specific values:
+  `references/function-reference.md`.
+* Steps must be **consecutive from `step_1`** (no gaps) and **type-compatible**; both are validated
+  at `create_pipeline()` time.
+* **Two different validation moments — do not conflate them:**
+  (a) `aidb.create_model(..., validate => true)` probes the provider endpoint **when the model is
+  registered**; (b) `aidb.create_pipeline()` re-resolves each referenced model and validates that it
+  has the capability the step needs (embedding / language / OCR) **before any data is touched**.
+  Neither happens per-row at execution time; a model deleted after creation fails at run time with
+  `Model not found: X`.
+* The **destination table must not already exist**.
+* `background_sync_interval` is range-checked by a SQL domain; out-of-range values are rejected with
+  a message stating the accepted range.
+* **Embedding dimensions are baked into the destination `value VECTOR(n)`** — never swap a KB's
+  model; build a new KB.
+* `topk` for retrieval must be ≥ 1.
+* `aidb.max_threads` changes require a **PostgreSQL restart**.
+* Pipeline errors always persist to the per-pipeline error table; `aidb.pipeline_error_warnings`
+  only controls whether they are also logged as WARNINGs.
+* Capabilities outside the five areas above (agents, tools, memory, MCP endpoints) exist in the
+  source tree but are **build-dependent** — do not volunteer them; see Appendix A of
+  `references/function-reference.md`.
 
----
+## Common errors → action
 
-## 12. Troubleshooting Decision Tree
-
-1. **`aidb` not found in `pg_available_extensions`** → Extension package not installed; contact DBA
-2. **`CREATE EXTENSION aidb` fails** → Ensure `shared_preload_libraries = 'aidb'` in `postgresql.conf` and PG was restarted; use `CASCADE`
-3. **Pipeline not processing automatically** → Check `auto_processing` mode; verify background workers are running (`SELECT * FROM pg_stat_activity WHERE backend_type LIKE '%background worker%'`)
-4. **Pipeline creation error about destination** → Drop the destination table first
-5. **Pipeline creation error about steps** → Review compatible step sequencing in [references/step-operations.md](references/step-operations.md)
-6. **Model encode/completion fails** → Verify model registered (`aidb.list_models()`); test with `aidb.encode_text('test', 'model_name')`; check credentials via re-registration
-7. **Similarity search returns nothing** → Check destination table row count; lower the similarity threshold; confirm embeddings are non-null
-8. **Semantic KB returns no results** → Run `aidb.refresh_semantic_kb('name')` after schema changes; lower similarity threshold
-
----
-
-## 13. Reference Files
-
-| File | When to Read |
+| Error text (quote it to the user) | Action |
 |---|---|
-| [references/model-adapters.md](references/model-adapters.md) | All supported providers, capabilities, config helpers, credential handling |
-| [references/step-operations.md](references/step-operations.md) | All pipeline step types, config helpers, compatible sequencing rules |
-| [references/function-reference.md](references/function-reference.md) | Complete SQL function signatures for all `aidb` schema functions |
+| `The destination table 'X' already exists.` | choose another `destination`, or drop it with consent |
+| `... does not support text embedding / language / OCR operations` | model lacks that adapter — pick another provider (`references/model-adapters.md`) |
+| `config must not contain "api_key" or "basic_auth"` | move the secret to `credentials` / `credentials_env` |
+| `Credentials for model provider "X" already exist` | `replace_credentials => true`, or omit credentials to reuse |
+| `Model provider with name "X" not found` | `SELECT * FROM aidb.model_providers;` |
+| `Steps must be defined in a consecutive order. Missing steps: [...]` | renumber steps 1..N |
+| `Output type '...' does not match input type '...'` | fix the chain (sequencing matrix in `references/step-operations.md`) |
+| `The source 'X' cannot be found.` | schema-qualify; check the table/volume exists and is readable |
+| `Table public.X is missing one or both columns` | wrong `source_key_column`/`source_data_column` |
+| Background pipeline never advances | `aidb` missing from `shared_preload_libraries`; use `run_pipeline()` meanwhile |
+| `Live` pipeline makes INSERTs slow | switch to `Background` with a sensible `batch_size` |
+
+## Destructive operations — always describe the blast radius and get explicit confirmation
+
+* `aidb.delete_pipeline` — also **drops the destination table** and intermediate step tables
+  (a shared KB vector table survives only if other pipelines are attached to it)
+* `aidb.delete_model` — drops the **provider-level** user mapping, which can break other models
+* `aidb.delete_knowledge_base` / `aidb.delete_semantic_kb`
+* `aidb.delete_volume_file` / `aidb.delete_volume` — touches real object storage
+* `aidb.clear_error_logs` — destroys the audit trail; prefer `requeue_pipeline_errors`
+* `DROP EXTENSION aidb CASCADE` — destroys every AIDB object in the database
+* switching a busy pipeline to `Live`; any GUC change needing a restart; `CREATE EXTENSION`
 
 ---
 
-## 14. Complete Workflow Example: Document Q&A Setup
+## Reference index (load on demand)
 
-```sql
--- 1. Install extension
-CREATE EXTENSION IF NOT EXISTS aidb CASCADE;
+| File | Use it for |
+|---|---|
+| `references/function-reference.md` | Full `aidb.*` signatures, config-helper catalogue, error-log API, retrieval helpers, Semantic KB & alias API, GUCs, permissions, build-specific enforced limits, and Appendix A (build-dependent surfaces) |
+| `references/step-operations.md` | Per-step semantics (accepts/produces/explodes rows), sequencing matrix, copy-paste pipeline templates (T1–T5, incl. a zero-dependency `dummy`-provider smoke test), operations runbook, symptom→cause→fix matrix, retry workflow, performance tuning |
+| `references/model-adapters.md` | Provider families (local, OpenAI-compatible, NIM, hosted, `dummy`), credential handling rules, capability→consumer map, model-choice decision guide |
 
--- 2. Register embedding model
-SELECT aidb.create_model('embed', 'openai_embeddings',
-    config => aidb.embeddings_config(model => 'text-embedding-3-small', api_key => 'sk-...'));
-
--- 3. Create source table and insert data
-CREATE TABLE docs (id SERIAL PRIMARY KEY, body TEXT NOT NULL);
-INSERT INTO docs (body) VALUES ('Refunds must be requested within 30 days of purchase.');
-INSERT INTO docs (body) VALUES ('Shipping is free for orders over $50.');
-
--- 4. Create pipeline
-SELECT aidb.create_pipeline(
-    name => 'docs_kb', source => 'docs',
-    source_key_column => 'id', source_data_column => 'body',
-    auto_processing => 'Background',
-    step_1 => 'KnowledgeBase',
-    step_1_options => aidb.knowledge_base_config(
-        model => 'embed', data_format => 'Text', distance_operator => 'Cosine')
-);
-
--- 5. Run pipeline to process existing rows
-SELECT aidb.run_pipeline('docs_kb');
-
--- 6. Search
-SELECT d.body, p.source_id
-FROM pipeline_docs_kb p
-JOIN docs d ON d.id = p.source_id
-ORDER BY p.embedding <=> aidb.encode_text_query('What is the refund policy?', 'embed')
-LIMIT 3;
-```
-
-New rows inserted into `docs` will be automatically embedded by the background worker.
+Product documentation: <https://www.enterprisedb.com/docs/aidb/latest/> — use it to confirm whether
+a capability is supported in the user's release before promising it.
