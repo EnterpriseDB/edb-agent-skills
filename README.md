@@ -16,23 +16,21 @@ The assembly pipeline reads configuration from `agent-config`, generates skill a
 
 ```
 agent-skills/
-├── skills/
-│   ├── {hm_version}/
-│   │   ├── {skill_name}/
-│   │   │   ├── SKILL.md
-│   │   │   ├── scripts/
-│   │   │   ├── references/
-│   │   │   └── assets/
-│   │   └── ...
-│   └── ...
-└── registry.json
+├── {skill_name}/
+│   ├── SKILL.md
+│   ├── scripts/
+│   ├── references/
+│   └── assets/
+├── ...
+└── assets/
+    └── registry.json
 ```
 
-### `registry.json`
+### `assets/registry.json`
 
-Index of all published skills. Maps skill names to their available versions and entry points.
+Index of all published skills. Maps skill names to their source commit SHAs and the build number they were last published with. Note this top-level `assets/` directory (holding `registry.json`) is distinct from the per-skill `{skill_name}/assets/` directories.
 
-### `skills/{hm_version}/{skill_name}/`
+### `{skill_name}/`
 
 Each skill is a self-contained directory structured for progressive disclosure — agents read `SKILL.md` first and load deeper resources only as needed.
 
@@ -52,4 +50,4 @@ Each skill is a self-contained directory structured for progressive disclosure �
 
 ## Versioning
 
-Skill directories are nested under `{hm_version}`, corresponding to the Hybrid Manager release they were assembled for. Tags on this repository align with those versions. Artifacts are treated as immutable once published for a given version.
+Skill directories are published in place at the repo root (no per-version directory); the build number / Hybrid Manager release each skill was last published with is recorded in `assets/registry.json` and tagged on this repository via the `Publish Skills` workflow in `agent-skills-pipeline`.
