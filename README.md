@@ -22,13 +22,12 @@ agent-skills/
 │   ├── references/
 │   └── assets/
 ├── ...
-└── assets/
-    └── registry.json
+└── registry.json
 ```
 
-### `assets/registry.json`
+### `registry.json`
 
-Index of all published skills. Maps skill names to their source commit SHAs and the build number they were last published with. Note this top-level `assets/` directory (holding `registry.json`) is distinct from the per-skill `{skill_name}/assets/` directories.
+Index of all published skills. Maps skill names to their source commit SHAs and the build number they were last published with.
 
 ### `{skill_name}/`
 
@@ -50,4 +49,4 @@ Each skill is a self-contained directory structured for progressive disclosure �
 
 ## Versioning
 
-Skill directories are published in place at the repo root (no per-version directory); the build number / Hybrid Manager release each skill was last published with is recorded in `assets/registry.json` and tagged on this repository via the `Publish Skills` workflow in `agent-skills-pipeline`.
+Skill directories are published in place at the repo root (no per-version directory); the build number / Hybrid Manager release each skill was last published with is recorded in `registry.json` and tagged on this repository via the `Publish Skills` workflow in `agent-skills-pipeline`.
