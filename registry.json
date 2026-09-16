@@ -1,0 +1,25 @@
+{
+  "skills": {
+    "pgaa": {
+      "repo_shas": {
+        "https://github.com/EnterpriseDB/beacon-analytics.git": "6fc29c06269b5396c0f79b4ebac1884f00c362fe"
+      },
+      "built_at": "1789591907Z",
+      "version": "0.0.5-validate"
+    },
+    "pgfs": {
+      "repo_shas": {
+        "https://github.com/EnterpriseDB/pgfs.git": "c2fe0d3b8cf8336a09daa3f881717c074f4434de"
+      },
+      "built_at": "1789591864Z",
+      "version": "0.0.5-validate"
+    },
+    "aidb": {
+      "repo_shas": {
+        "https://github.com/EnterpriseDB/aidb.git": "f8a2b15b725e8287921f25cca25ce609d7235649"
+      },
+      "built_at": "1789591966Z",
+      "version": "0.0.5-validate"
+    }
+  }
+}
