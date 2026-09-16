@@ -1,0 +1,71 @@
+{
+  "skill": "aidb",
+  "aliases": ["aidb", "ai-factory"],
+  "categories": [
+    "pipelines",
+    "model-management",
+    "embeddings",
+    "text-generation",
+    "semantic-kb",
+    "agents",
+    "tools",
+    "memory",
+    "governance",
+    "mcp",
+    "telemetry"
+  ],
+  "trigger_phrases": [
+    "create a pipeline",
+    "register a model",
+    "embed text",
+    "generate embeddings",
+    "similarity search",
+    "semantic knowledge base",
+    "create an agent",
+    "agent conversation",
+    "run tool",
+    "import MCP tools",
+    "chunk text",
+    "summarize document",
+    "extract PDF text",
+    "OCR image",
+    "parse HTML",
+    "create semantic alias",
+    "purpose registry",
+    "agent memory",
+    "session memory",
+    "AI factory",
+    "EDB Postgres AI",
+    "sovereign AI",
+    "aidb extension"
+  ],
+  "supported_postgres_versions": ["14", "15", "16", "17", "18"],
+  "key_constraints": {
+    "pipeline_name_max_length": 46,
+    "pipeline_max_steps": 10,
+    "destination_table_must_not_exist": true,
+    "deprecated": [
+      "KnowledgeBase pipeline step (still works, emit warnings — use create_semantic_kb instead)",
+      "aidb.decode_text / aidb.decode_text_batch (use generate_text / generate_text_batch)"
+    ],
+    "thread_pool_restart_required": "aidb.max_threads requires a PostgreSQL server restart",
+    "agent_converse_never_raises": true,
+    "join_routing_requires_approval": true
+  },
+  "install_command": "CREATE EXTENSION aidb CASCADE;",
+  "primary_schema": "aidb",
+  "memory_schema": "aidb_memory",
+  "internal_schema": "aidb_internal",
+  "references": {
+    "function_reference": "references/function-reference.md",
+    "model_adapters": "references/model-adapters.md",
+    "step_operations": "references/step-operations.md",
+    "troubleshooting": "references/troubleshooting.md"
+  },
+  "scripts": {
+    "diagnose": "scripts/diagnose_aidb.sql",
+    "quickstart_pipeline": "scripts/quickstart_embedding_pipeline.sql",
+    "quickstart_agent": "scripts/quickstart_agent.sql",
+    "quickstart_semantic_kb": "scripts/quickstart_semantic_kb.sql"
+  }
+}
