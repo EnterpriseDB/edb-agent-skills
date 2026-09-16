@@ -1,0 +1,11 @@
+{
+  "skills": {
+    "aidb": {
+      "repo_shas": {
+        "https://github.com/EnterpriseDB/aidb.git": "f8a2b15b725e8287921f25cca25ce609d7235649"
+      },
+      "built_at": "1789587028Z",
+      "version": "0.0.3-proof"
+    }
+  }
+}
