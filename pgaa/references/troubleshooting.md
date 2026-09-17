@@ -1,213 +1,288 @@
-# pgaa Troubleshooting Guide
+# pgaa Troubleshooting & Gotchas
 
-## Query Performance Issues
-
-### Symptom: Analytical queries on PGAA tables are slow
-
-**Diagnosis steps:**
-
-1. Check which scan mode is being used:
-   ```sql
-   EXPLAIN SELECT * FROM my_analytics_table WHERE ...;
-   -- Look for "Custom Scan (pgaa)" with DirectScan or CompatScan in the plan
-   ```
-
-2. Check pushdown GUCs:
-   ```sql
-   SHOW pgaa.enable_direct_scan;
-   SHOW pgaa.enable_join_pushdown;
-   SHOW pgaa.enable_groupby_pushdown;
-   SHOW pgaa.enable_orderby_pushdown;
-   SHOW pgaa.enable_window_pushdown;
-   ```
-
-3. Surface why DirectScan may be falling back:
-   ```sql
-   SET pgaa.direct_scan_fail_behavior = 'error';  -- or 'notice'
-   -- Re-run query to see the reason
-   ```
-
-4. Verify engine is reachable:
-   ```sql
-   SELECT pgaa.engine_version();  -- NULL or error indicates engine is down
-   ```
-
-5. Check cost estimates:
-   ```sql
-   SHOW pgaa.scan_startup_cost;
-   SHOW pgaa.scan_per_tuple_cost;
-   SHOW pgaa.use_seafowl_cost_estimates;
-   ```
-
-### Symptom: DirectScan not working after search_path change
-
-- Ensure schema-qualified table names all come from the same catalog, OR
-- Unqualify table names and rely on `search_path`
+A curated reference for diagnosing the most common pgaa errors, misconfigurations, and behavioral surprises. Organized by symptom.
 
 ---
 
-## Catalog Connectivity
+## Installation & Setup
 
-### Symptom: `pgaa.add_catalog()` fails with connection error
+### `CREATE EXTENSION pgaa` fails with "required extension pgfs is not installed"
 
-1. Pre-validate before registering:
-   ```sql
-   SELECT pgaa.validate_catalog_connection('iceberg-rest', '{"url": "...", "token": "..."}');
-   -- NULL = success; error text = problem
-   ```
-
-2. Check catalog options format:
-   - `iceberg-rest` requires `"url"` key
-   - `iceberg-s3tables` requires `"arn"` key
-
-3. For self-signed TLS in dev/test:
-   ```json
-   {"url": "...", "danger_accept_invalid_certs": "true"}
-   ```
-
-### Symptom: Attached catalog tables are stale / not refreshing
-
-1. Check metastore sync worker is enabled:
-   ```sql
-   SHOW pgaa.enable_metastore_sync_worker;
-   ```
-
-2. Check catalog status:
-   ```sql
-   SELECT name, status, refreshed_at FROM pgaa.list_catalogs();
-   -- status should be 'attached'; 'refresh_failed' means sync is failing
-   ```
-
-3. Adjust poll rate:
-   ```sql
-   -- In postgresql.conf or ALTER SYSTEM:
-   pgaa.metastore_sync_poll_rate_s = 30
-   ```
-
-4. Force a one-time re-import:
-   ```sql
-   SELECT pgaa.import_catalog('my-catalog');
-   ```
-
----
-
-## Replication Issues
-
-### Symptom: PGAA tables are behind / replication lag is high
-
-1. Check replication status:
-   ```sql
-   SELECT table_name, replication_status FROM pgaa.list_analytics_tables();
-   ```
-
-2. Check lag settings:
-   ```sql
-   SHOW pgaa.max_replication_lag_s;
-   SHOW pgaa.flush_task_interval_s;
-   ```
-
-3. Run a replication benchmark:
-   ```sql
-   SELECT pgaa.bench_replication(...);
-   ```
-
-### Symptom: `VACUUM` on a PGAA table raises a NOTICE
-
-This is expected behavior. PGAA tables store data in object storage, not heap pages.
-A NOTICE is emitted and the vacuum is skipped gracefully. This is not an error.
-
----
-
-## Storage Location Issues
-
-### Symptom: `CREATE TABLE ... USING PGAA` fails with storage location error
-
-1. Verify the pgfs storage location exists:
-   ```sql
-   -- The pgfs skill/extension manages storage locations
-   SELECT * FROM pgfs.list_storage_locations();
-   ```
-
-2. Test the storage location:
-   ```sql
-   SELECT pgaa.test_storage_location('my-location', true);  -- true = test writes too
-   -- NULL = success
-   ```
-
-3. Ensure `pgaa.storage_location` in `WITH (...)` matches an existing pgfs location name.
-
----
-
-## Extension / Engine Setup
-
-### Symptom: `pgaa.spark_sql()` returns an error
-
-- Verify `pgaa.executor_engine = 'spark_connect'`
-- Verify `pgaa.spark_connect_url` points to a running Spark Connect endpoint
-- `pgaa.spark_sql()` is **only** available when `executor_engine = 'spark_connect'`
-
-### Symptom: Engine not reachable after install
-
-1. Check that Seafowl is running (default engine):
-   ```sql
-   SELECT pgaa.engine_version();
-   ```
-
-2. If using autostart, confirm:
-   ```sql
-   SHOW pgaa.autostart_seafowl;
-   SHOW pgaa.autostart_seafowl_port;
-   ```
-
-3. Review PostgreSQL logs for Seafowl startup errors.
-
-4. For on-prem WarehousePG: Seafowl runs as a systemd service (`seafowl.service`).
-
----
-
-## Table & Data Management
-
-### Symptom: `pgaa.delete_catalog()` raises "Catalog is not empty"
-
-By design — prevents accidental data loss. Use:
+Use `CASCADE` to auto-install the `pgfs` dependency:
 ```sql
-SELECT pgaa.delete_catalog('my-catalog', cascade := true);
--- or manually drop tables first:
-SELECT pgaa.drop_catalog_tables('my-catalog');
-SELECT pgaa.delete_catalog('my-catalog');
+CREATE EXTENSION pgaa CASCADE;
 ```
 
-### Symptom: `pg_dump` / `gprestore` leaves PGAA tables empty
+### pgaa tables return no results or queries fail immediately after installation on WarehousePG
 
-- As of 1.10.0, a `table_mapping_restore_guard` trigger prevents PK conflicts
-  during `gprestore` COPY operations from causing silent data loss.
-- For older versions, upgrade to 1.10.0+ before performing backup/restore.
+**Cause:** `pgaa` is not listed in `shared_preload_libraries`.  
+**Fix:** Add `pgaa` to `postgresql.conf` on the coordinator and all segment hosts, then restart the cluster:
+```
+shared_preload_libraries = 'pgaa'
+```
 
-### Symptom: INSERT into PGAA table returns an error
+### Seafowl does not start / queries fail with "connection refused" to localhost:47470
 
-Direct `INSERT` into `USING PGAA` tables is not supported (returns a clear error as of 1.9.0).
-Data gets into PGAA tables via:
-- `CREATE TABLE ... USING PGAA AS (SELECT ...)` (CTAS)
-- PGD logical replication / `pgaa.enable_analytics_replication()`
-- Catalog sync (`attach_catalog` / `import_catalog`)
+Check:
+1. `SHOW pgaa.autostart_seafowl;` — if `off`, Seafowl won't auto-start. Set to `on` in `postgresql.conf`.
+2. `SHOW pgaa.autostart_seafowl_port;` — confirms which port Seafowl listens on (default `47470`).
+3. On WarehousePG, Seafowl runs as a systemd service (`seafowl.service`) rather than a background worker — check its status with `systemctl status seafowl`.
+4. If using a manually-started external Seafowl: `SHOW pgaa.seafowl_url;` — ensure it points to the correct host/port.
 
 ---
 
-## Background Tasks
+## Table Creation
 
-### Check task status:
+### `CREATE TABLE ... USING PGAA` with empty column list `()` — is that an error?
+
+No. An **empty column list** is the signal for pgaa to **auto-discover the schema** from the lakehouse table (Iceberg catalog or storage location). This is the recommended pattern for catalog-managed tables. Providing explicit columns is also valid when schema pinning is desired.
+
+### CTAS (`CREATE TABLE ... AS SELECT`) fails with "data already exists at target path"
+
+Add `pgaa.purge_data_if_exists = true` to the `WITH (...)` clause:
 ```sql
-SELECT id, type, status, started_at, finished_at, output
+CREATE TABLE analytics.result USING PGAA WITH (
+    pgaa.storage_location      = 'my-store',
+    pgaa.path                  = 'results/output/',
+    pgaa.format                = 'delta',
+    pgaa.purge_data_if_exists  = true
+) AS SELECT * FROM source;
+```
+
+### CTAS is slow or the EXPLAIN plan shows PostgreSQL executor operations on the source
+
+Expected behavior. **CTAS source queries always use CompatScan** (the PostgreSQL executor), never DirectScan. This is a known limitation — only the write side uses the lakehouse engine directly.
+
+### `ALTER TABLE ... SET ACCESS METHOD pgaa` — what options are required?
+
+Minimum required options depend on the storage pattern:
+
+```sql
+-- Catalog-managed conversion
+ALTER TABLE public.my_table
+    SET ACCESS METHOD pgaa,
+    SET (
+        pgaa.auto_truncate     = 'true',
+        pgaa.format            = 'iceberg',
+        pgaa.managed_by        = 'my_catalog',
+        pgaa.catalog_namespace = 'public',
+        pgaa.catalog_table     = 'my_table'
+    );
+
+-- Direct storage location conversion
+ALTER TABLE public.my_table
+    SET ACCESS METHOD pgaa,
+    SET (
+        pgaa.auto_truncate    = 'true',
+        pgaa.format           = 'delta',
+        pgaa.storage_location = 'my-location',
+        pgaa.path             = 'public.my_table'
+    );
+```
+
+`pgaa.auto_truncate = 'true'` is required on PGD to flush heap data when switching access methods.
+
+---
+
+## Catalog Management
+
+### `pgaa.add_catalog()` fails immediately
+
+`pgaa.add_catalog()` validates the connection before registering. Common causes:
+- **Iceberg REST:** incorrect `url`, expired `token`, or wrong `warehouse` UUID. Use `pgaa.validate_catalog_connection()` to pre-check without registering.
+- **Iceberg S3 Tables:** missing or incorrect `arn` or `region`.
+- Self-signed TLS certificates: add `"danger_accept_invalid_certs": "true"` to catalog options (dev/test environments only).
+
+```sql
+-- Pre-validation (returns NULL on success, error string on failure)
+SELECT pgaa.validate_catalog_connection(
+    'iceberg-rest',
+    '{"url":"https://my-catalog/api/iceberg", "token":"..."}'
+);
+```
+
+### `pgaa.delete_catalog()` doesn't drop the catalog's tables
+
+By default, `cascade` is `false`. To also drop managed tables:
+```sql
+SELECT * FROM pgaa.delete_catalog('my_catalog', cascade := true);
+```
+
+### Schema changes in the upstream catalog are not reflected in PostgreSQL
+
+pgaa does **not** automatically apply schema evolution to existing PostgreSQL tables. After an upstream catalog table schema change:
+```sql
+ALTER TABLE analytics.my_table
+    ADD COLUMN new_col TEXT,
+    DROP COLUMN old_col;
+```
+You must manually `ALTER TABLE` in PostgreSQL to match the lakehouse schema.
+
+### Catalog status shows `refresh_failed` or `refresh_retry`
+
+Check the PostgreSQL log for the underlying error. Common causes:
+- Network connectivity to the catalog endpoint.
+- Expired or rotated token/credentials.
+- Use `pgaa.test_catalog('my_catalog', false)` to probe without writes (returns NULL on success, error string on failure).
+- Re-register with updated credentials via `pgaa.update_catalog('my_catalog', '{"token":"new-token"}'::json)`.
+
+---
+
+## Background Maintenance Tasks
+
+### `pgaa.launch_task()` returns a UUID but the task never runs
+
+**Most common cause:** `pgaa.enable_maintenance_worker` is `off` (the default).
+
+```sql
+-- Check current state
+SHOW pgaa.enable_maintenance_worker;
+
+-- Enable (requires postgresql.conf change and reload or restart)
+ALTER SYSTEM SET pgaa.enable_maintenance_worker = on;
+SELECT pg_reload_conf();
+```
+
+Without this GUC set to `on`, tasks queue indefinitely with `pending` status.
+
+### `pgaa.launch_task()` with `task_type = 'zorder'` fails on an Iceberg table
+
+`zorder`, `vacuum`, and `purge` task types are **Delta format only**. For Iceberg tables, only `compaction` is supported via `launch_task`. Use `pgaa.spark_sql()` (requires `spark_connect` engine) for zorder/vacuum/purge on Iceberg:
+
+```sql
+SET pgaa.executor_engine = 'spark_connect';
+SET pgaa.spark_connect_url = 'sc://spark-host:15002';
+
+SELECT pgaa.spark_sql(
+    'CALL system.rewrite_data_files(table => "catalog.namespace.table_name")',
+    'my_iceberg_catalog'
+);
+```
+
+### Task status stuck at `running`
+
+Check for worker crashes in the PostgreSQL log. A task may be stuck if the maintenance worker process was killed while running. Safe to re-launch; the previous task record stays in `pgaa.background_task` for audit purposes.
+
+---
+
+## PGD Replication
+
+### Re-enabling replication wiped the analytics data
+
+This is **expected behavior**: re-enabling replication triggers a full reload — all existing analytics data is removed, and the current local table data is re-uploaded. Warn users before calling `pgaa.enable_analytics_replication()` on a table that previously had replication enabled.
+
+### `bdr.wait_slot_confirm_lsn()` is blocking indefinitely
+
+This function blocks until all WAL records have been replicated. It **must only be called after all writes to the table have stopped**. If writes are ongoing when you call it, it will never return. There is no timeout — cancel with `pg_cancel_backend()` or `Ctrl-C` if called accidentally while writes are active.
+
+### `pgaa.restore_from_analytics()` completed but storage costs are still high
+
+`pgaa.restore_from_analytics()` **does not clean up files in object storage** — it only restores data to the local heap. To free object storage, manually delete the orphaned files using your cloud provider's console, CLI, or a tool like PyIceberg.
+
+### PGD replication works but reads still come from heap
+
+Ensure the session GUC is set:
+```sql
+SET bdr.prefer_analytics_engine = true;
+```
+This is a session-level setting. It can be set as a default in `postgresql.conf` or `ALTER ROLE ... SET` if always-on analytics reads are desired.
+
+---
+
+## Iceberg S3 Tables Limitations
+
+Iceberg S3 Tables catalogs have the following hard restrictions in pgaa:
+- **No PGD replication** (`pgd.replicate_to_analytics`)
+- **No tiered tables** (`pgaa.convert_to_tiered_table`)
+- **No analytics offload**
+
+For any of these features, switch to an **Iceberg REST catalog**.
+
+---
+
+## Spark Connect Integration
+
+### Spark queries return errors or stale results
+
+- Confirm `pgaa.executor_engine = 'spark_connect'` and `pgaa.spark_connect_url` is set.
+- Spark Connect is **read-only** — all writes must go through PostgreSQL (the Seafowl/pgaa write path).
+- Spark returns results as a JSON object — parse appropriately in the application layer.
+
+### Spark Iceberg equality deletes may be skipped
+
+A known upstream behavior: equality deletes can be missed during concurrent reads with Spark. Workaround:
+```sql
+SELECT pgaa.spark_sql(
+    'SET spark.sql.iceberg.executor-cache.enabled=false; SELECT ...',
+    'my_catalog'
+);
+```
+
+---
+
+## Performance & Query Planning
+
+### Queries are slow / not using DirectScan
+
+Check:
+```sql
+SHOW pgaa.enable_direct_scan;         -- should be 'on'
+SHOW pgaa.enable_join_pushdown;       -- should be 'on' for joins
+SHOW pgaa.enable_groupby_pushdown;    -- should be 'on' for aggregations
+```
+
+If DirectScan is on but still using CompatScan, check `pgaa.direct_scan_fail_behavior`:
+- `'warn'` (default): CompatScan silently used with a warning in logs
+- `'error'`: Forces an error if DirectScan fails (useful for debugging)
+
+### DataFusion tuning
+
+Explore and set DataFusion-level parameters:
+```sql
+-- List all DataFusion options
+SELECT name, setting, short_desc
+FROM pg_settings
+WHERE name LIKE 'pgaa.datafusion%';
+
+-- Common tuning knobs
+SET pgaa.datafusion.execution.target_partitions = 8;
+SET pgaa.datafusion.execution.batch_size = 8192;
+```
+
+---
+
+## Diagnostic Quick Reference
+
+```sql
+-- Version info
+SELECT pgaa.pgaa_version();
+SELECT pgaa.seafowl_version();
+SELECT pgaa.engine_version();  -- whichever engine is currently selected
+
+-- List all pgaa tables with storage/replication info
+SELECT * FROM pgaa.list_analytics_tables();
+
+-- Storage size for a specific table
+SELECT * FROM pgaa.lakehouse_table_stats('schema.table_name'::regclass);
+
+-- List all catalogs and their sync status
+SELECT * FROM pgaa.list_catalogs();
+
+-- Test a catalog connection (NULL = OK, string = error message)
+SELECT pgaa.test_catalog('my_catalog', false);
+
+-- Test a storage location
+SELECT pgaa.test_storage_location('my-location', false);
+
+-- Inspect background task status
+SELECT id, task_type, status, created_at, finished_at
 FROM pgaa.background_task
-WHERE target_table = 'my_schema.my_table'::regclass
-ORDER BY scheduled_at DESC;
-```
+ORDER BY created_at DESC
+LIMIT 20;
 
-### Wait for a task to complete:
-```sql
-SELECT pgaa._wait_for_task('<uuid>', poll_interval_seconds := 5.0);
+-- Check all relevant GUCs
+SELECT name, setting
+FROM pg_settings
+WHERE name LIKE 'pgaa.%'
+ORDER BY name;
 ```
-
-### Task constraints:
-- Only one `pending` task of each type per table (enforced by unique index)
-- Only one `running` task per table at a time

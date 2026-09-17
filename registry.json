@@ -7,18 +7,19 @@
       "built_at": "1789602983Z",
       "version": "1.0.0"
     },
+    "pgaa": {
+      "repo_shas": {
+        "https://github.com/EnterpriseDB/beacon-analytics.git": "6fc29c06269b5396c0f79b4ebac1884f00c362fe",
+        "https://github.com/EnterpriseDB/analytics-llm-product-reference.git": "97c9972a6ad6741b4930d18c2863475b82c31734"
+      },
+      "built_at": "1789605844Z",
+      "version": "1.1.0"
+    },
     "pgfs": {
       "repo_shas": {
         "https://github.com/EnterpriseDB/pgfs.git": "c2fe0d3b8cf8336a09daa3f881717c074f4434de"
       },
       "built_at": "1789602112Z",
-      "version": "1.0.0"
-    },
-    "pgaa": {
-      "repo_shas": {
-        "https://github.com/EnterpriseDB/beacon-analytics.git": "6fc29c06269b5396c0f79b4ebac1884f00c362fe"
-      },
-      "built_at": "1789602169Z",
       "version": "1.0.0"
     }
   }
