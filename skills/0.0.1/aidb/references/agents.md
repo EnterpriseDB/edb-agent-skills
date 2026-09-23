@@ -4,9 +4,28 @@ Signature reference for in-database agents. Introduced in AIDB 7.6.0.
 
 An agent is a named, reusable configuration — instructions, a model, and an allowed tool set — that AIDB runs through a ReAct-style loop: the model thinks, optionally calls tools, observes results, and repeats until it has an answer. Agents are ordinary Postgres objects driven entirely from SQL.
 
+## Discovery queries — run these before advising
+
+```sql
+-- Existing agents (there is no list_agents function -- query the view)
+SELECT name, model, role, tools, delegates, max_iterations, timeout_seconds, budget_strategy
+FROM aidb.agents ORDER BY name;
+
+-- Candidate models for a new agent (filter the result by the tiering below)
+SELECT name, provider FROM aidb.models ORDER BY provider, name;
+
+-- Tools this agent could be granted
+SELECT name, tool_type, read_only, description FROM aidb.tools ORDER BY tool_type, name;
+
+-- Recent activity
+SELECT * FROM aidb.agent_tasks ORDER BY created_at DESC LIMIT 20;
+```
+
 ## Error convention
 
 Most agent functions **never raise** for a logic failure. They return an `error` column instead, so the transaction (and anything already logged) still commits. The exceptions are `aidb.start_agent_session()` and `aidb.get_conversation()`, which do raise on an empty/unknown argument.
+
+Always select the `error` column — a successful-looking call with `message IS NULL` and a populated `error` is a failure.
 
 ## Catalog views
 
@@ -66,13 +85,28 @@ Without `force`, deletion fails if the agent has conversation history. `force =>
 
 ## Choosing a model
 
-`model` must name a registered model capable of generating text and following instructions.
+`model` must name a registered model capable of generating text and following instructions. Present the tiers below as a multiple-choice menu, restricted to models that actually exist in `aidb.models`.
 
-**Rejected outright:** embedding, reranking, OCR, and multimodal-embedding providers (`bert_local`, `openai_embeddings`, `nim_reranking`, `clip_local`, …), plus `t5_local` — it has no instruction-following or system-prompt support.
+**Rejected outright** — never offer these: embedding, reranking, OCR, and multimodal-embedding providers (`bert_local`, `llamacpp_embeddings`, `openai_embeddings`, `openrouter_embeddings`, `embeddings`, `nim_embeddings`, `nim_clip`, `nim_reranking`, `llamacpp_reranking`, `clip_local`, `nim_paddle_ocr`, `llamacpp_ocr`), plus `t5_local` — it has no instruction-following or system-prompt support.
 
 **Preferred** (real provider-native tool calls): `openai_responses` (+ `_azure`), `anthropic_messages` (+ `_azure`/`_bedrock`), `llamacpp_generate`.
 
-**Supported** (AIDB simulates tool calling by describing tools in the prompt and parsing the reply): `openai_completions`, `completions`, `nim_completions`, `openrouter_chat`, `gemini`, `llama_instruct_local`.
+**Supported** (AIDB simulates tool calling by describing tools in the prompt and parsing the reply — works, but is less reliable with many tools): `openai_completions`, `completions`, `nim_completions`, `openrouter_chat`, `gemini`, `llama_instruct_local`.
+
+If the only registered generation model is in the "supported" tier, say so and keep the tool list short.
+
+## Creation checklist
+
+Walk the user through these, proposing a value for each, before printing the final `create_agent` call:
+
+1. **Name** — unique in `aidb.agents`.
+2. **Instructions** — remember they double as the tool description if this agent is ever a delegate.
+3. **Model** — from the tiers above, chosen from models that exist here.
+4. **Tools** — explicit array from `aidb.tools`; every native tool must be listed explicitly except `sleep`. Prefer the smallest useful set.
+5. **Role** — pin a least-privilege role if the agent can run SQL; the caller must be a member of it.
+6. **Limits** — `max_iterations` (≤25), `timeout` (default 300s), token budgets, `budget_strategy`.
+7. **Structured output** — `aidb.output_type()` if the answer must be machine-readable.
+8. **Delegates** — other agents it may hand off to (depth capped at 10).
 
 ## Conversation functions
 
@@ -178,3 +212,40 @@ Every task runs synchronously to completion within one `agent_converse` call, so
 ### `aidb.action_type`
 
 `user_prompt` | `answer` (as surfaced in `aidb.conversation_log`).
+
+## Worked example
+
+```sql
+-- A read-only schema-exploration agent over an existing semantic KB
+SELECT * FROM aidb.create_agent(
+    name         => 'schema_helper',
+    instructions => 'Answer questions about this database''s schema. Use semantic search to '
+                    'find candidate tables, then catalog tools for exact column detail. '
+                    'Always name the schema and table you used.',
+    model        => 'gpt_4o',
+    tools        => ARRAY['semantic_kb_search', 'get_column_definitions',
+                          'catalog_get_object_details', 'run_sql_query'],
+    role         => 'reporting_ro',
+    max_iterations => 8,
+    timeout      => 120);
+
+SELECT message, conversation_id, error
+FROM aidb.agent_converse('schema_helper', 'Where do we store customer email addresses?',
+                         read_only => true);
+
+-- Continue the conversation (only possible when read_only was not set)
+SELECT message, error
+FROM aidb.agent_converse('schema_helper', 'And which of those are nullable?',
+                         conversation_id => '<id from the previous call>');
+```
+
+## Common errors
+
+| Symptom | Cause / fix |
+|---|---|
+| `error` column mentions the model | The model does not exist, or its provider cannot generate text — see the tiering above |
+| `error` mentions an unknown tool | Tool name not in `aidb.tools`; native tools must be listed explicitly |
+| Agent never calls a tool | Provider only simulates tool calling — shorten the tool list or move to a preferred-tier model |
+| `conversation_id` is NULL | The run was read-only (explicitly, or automatically on a replica) |
+| Deletion refused | Conversation history exists — use `force => true` |
+| Run stops early | Budget/iteration/timeout exceeded; inspect `budget_strategy` and `aidb.agent_tasks.status` |

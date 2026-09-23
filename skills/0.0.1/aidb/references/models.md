@@ -4,6 +4,24 @@ Signature reference for model registration, inference, and config helpers. AIDB 
 
 A model is registered once by name, then referenced by that name everywhere else (pipeline steps, standalone functions, knowledge bases, agents).
 
+## Discovery queries — run these before advising
+
+The installed extension is the authority; the lists further down are the stock defaults only.
+
+```sql
+-- Which providers exist here? Only offer providers returned by this query.
+SELECT server_name, server_description FROM aidb.model_providers ORDER BY server_name;
+
+-- Is one specific provider available? (e.g. before offering HuggingFace TEI)
+SELECT EXISTS (SELECT 1 FROM aidb.model_providers WHERE server_name = 'hf_tei') AS available;
+
+-- What models are already registered, and what can each of them do?
+SELECT name, provider, functions FROM aidb.models ORDER BY provider, name;
+
+-- Does a model registration embed credentials in `config`? (security audit)
+SELECT * FROM aidb.audit_leaked_credentials();
+```
+
 ## Configuration model
 
 Two distinct layers, and it matters which one a setting belongs to:
@@ -52,25 +70,38 @@ Only these accept a call-time override:
 | `credentials` | JSONB | `'{}'` | e.g. `{"api_key": "..."}`. Stored in `pg_user_mappings` |
 | `replace_credentials` | BOOLEAN | `false` | Update stored credentials without re-creating the model |
 | `validate` | BOOLEAN | `true` | Probe the model at creation time to confirm it works |
-| `credentials_env` | TEXT | NULL | Name of an environment variable to read credentials from. Mutually exclusive with `credentials` |
+| `credentials_env` | TEXT | NULL | Name of an environment variable to read credentials from |
+
+`credentials`, `credentials_env`, and (where present, see below) `credentials_k8s_secret` are **mutually exclusive** — supplying more than one raises.
+
+**Credentials are per provider, not per model.** They are stored as a `PUBLIC` user mapping on the provider's foreign server, so a second model on the same provider reuses them. Registering a second model with *different* credentials for the same provider fails unless you pass `replace_credentials => true`, which overwrites them for every model on that provider.
 
 **Validation.** With `validate => true`, a minimal probe inference runs before the registration commits — local models are downloaded and loaded; external models get a small test request. On failure nothing is registered. Use `validate => false` to defer a large download or register ahead of credentials being available, then `aidb.validate_model()` later.
 
 **`credentials_env`.** Only the variable *name* is stored; the value is read from the Postgres backend process environment at each use and never persisted. The variable may hold a bare secret (used as `api_key`) or a JSON object (e.g. `{"basic_auth": "..."}`). Its name must start with the prefix in the `aidb.env_var_allowed_prefix` GUC (`AIDB_` by default) — this prevents a model config from naming an arbitrary host environment variable and exfiltrating it. The same mechanism backs MCP `headers_env`.
 
-**Leaked credentials (7.6.0 change).** `create_model()` now *rejects* a `config` that embeds `api_key` or `basic_auth` directly. Pass secrets via `credentials` or `credentials_env`.
+**`credentials_k8s_secret`.** Newer builds add a third, equally non-persisting option: an absolute path into a mounted Kubernetes Secret volume, read fresh at each use (a single file becomes `api_key`; a directory with `username`/`password` files becomes base64 `basic_auth`; a JSON object is used as-is). It is gated by an allowed-path-prefix GUC. **Confirm it exists on the target before offering it** — `\df aidb.create_model` or `SELECT pg_get_function_arguments(oid) FROM pg_proc WHERE proname = 'create_model';`.
 
-> **Binding handling rule.** Never write a literal secret into a model's `config`, and never print one in the SQL you show the user. Route every credential through `credentials` or `credentials_env`; prefer `credentials_env` so nothing is persisted at all.
->
-> One provider quirk to be aware of rather than to exploit: `aidb.gemini_config()` declares `api_key` as a config field (see the helper table below), so a Gemini config *can* carry a key and it lands in the less-restricted config store instead of the credentials store. Do not take that route. Register Gemini with `credentials_env` (or `credentials`) like every other remote provider, and if you meet an installation where that genuinely fails, report the failure to the user and let them decide — do not silently inline the key. Run `aidb.audit_leaked_credentials()` on any installation you inherit.
+### Credentials must never live in `config`
 
-**TLS.** Add a `tls_config` object inside `config`: `{"insecure_skip_verify": bool, "ca_path": "/path/to/ca.pem"}`.
+`config` is stored in cleartext as a foreign-table option; `credentials` lives behind a user mapping. `aidb.create_model()` therefore **rejects any `config` containing an `api_key` or `basic_auth` key at any nesting depth**, for every provider without exception:
+
+```
+ERROR: config must not contain "api_key" or "basic_auth" -- pass them via the
+credentials, credentials_env, or credentials_k8s_secret argument instead
+```
+
+Consequences to know:
+
+- Every config helper that has an `api_key` / `basic_auth` parameter (`embeddings_config`, `completions_config`, `openai_responses_config`, `anthropic_messages_config`, `nim_*_config`, `openrouter_*_config`, `gemini_config`, …) still *accepts* one, but the resulting JSONB is then unusable as `create_model`'s `config`. **Always leave those parameters NULL** (`jsonb_strip_nulls` drops them) and pass the secret through `credentials_env`.
+- **Provider quirk — `gemini`:** `aidb.gemini_config()` declares `api_key` as its first, *required* parameter, a leftover from when Gemini kept its key in `config`. Pass `api_key => NULL` explicitly and supply the key via `credentials_env` (or `credentials`) like every other provider.
+- `aidb.audit_leaked_credentials()` reports models registered *before* the check existed, whose `config` still embeds a secret. Treat a non-empty result as a finding: re-register those models with `credentials_env` and rotate the key.
 
 ### `aidb.audit_leaked_credentials`
 
-No arguments. Reports pre-existing models where credentials were detected embedded in `config`.
+No arguments. Returns `TABLE(model_name TEXT, detected_key TEXT, detected_at TIMESTAMPTZ)`.
 
-Returns `TABLE(model_name TEXT, detected_key TEXT, detected_at TIMESTAMPTZ)`.
+**TLS.** Add a `tls_config` object inside `config`: `{"insecure_skip_verify": bool, "ca_path": "/path/to/ca.pem"}`.
 
 ### `aidb.get_model`
 
@@ -143,6 +174,8 @@ Only `llamacpp_generate`, `openai_responses` (+ `_azure`), and `anthropic_messag
 
 ## Providers
 
+**Always confirm against `SELECT server_name FROM aidb.model_providers` on the target installation before offering any of these.** The set of registered foreign servers is a property of the installed build; do not assume a count or that a given name is present.
+
 ### Local
 
 | Provider | Runtime | Purpose |
@@ -157,7 +190,7 @@ Only `llamacpp_generate`, `openai_responses` (+ `_azure`), and `anthropic_messag
 | `llamacpp_ocr` | llama.cpp | OCR from a GGUF vision model |
 | `dummy` | — | Deterministic fake output for testing |
 
-### External
+### Remote
 
 | Family | Providers |
 |---|---|
@@ -167,37 +200,49 @@ Only `llamacpp_generate`, `openai_responses` (+ `_azure`), and `anthropic_messag
 | NVIDIA NIM | `nim_embeddings`, `nim_completions`, `nim_clip`, `nim_reranking`, `nim_paddle_ocr` |
 | Google | `gemini` |
 | OpenRouter | `openrouter_chat`, `openrouter_embeddings` |
+| HuggingFace TEI | `hf_tei` (embeddings), `hf_tei_reranking` (reranking) — **build-dependent, see below** |
 
-Together with the nine local providers, these are the complete set of 26 foreign servers `CREATE EXTENSION` registers **in the build this reference was written against**. `embeddings` and `completions` are the generic OpenAI-compatible adapters; `openai_*` and `nim_*` are preconfigured specializations of the same adapters.
+`embeddings` and `completions` are the generic OpenAI-compatible adapters; `openai_*` and `nim_*` are preconfigured specializations of the same adapters.
 
-> **The installation is the authority, not this list.** Before offering any provider, run
-> `SELECT server_name, server_description FROM aidb.model_providers ORDER BY 1;`
-> and work from what it returns. Never claim a provider is unavailable without having run that query on the target installation.
+#### HuggingFace TEI (`hf_tei`, `hf_tei_reranking`)
 
-**HuggingFace TEI.** EDB product material lists HuggingFace TEI among the usable remote providers. The names `hf_tei` and `hf_tei_reranking` appear in the codebase, and in the build this reference was written against they had no registered foreign server, so `aidb.create_model()` could not use them there. Resolve this the same way as anything else: query `aidb.model_providers` on the target installation. If a TEI server name is present, use it. If it is not, say so factually ("this installation registers no `hf_tei` server — here is what it does register") and offer the generic OpenAI-compatible `embeddings` adapter, which takes an arbitrary `url`, as the alternative.
+For models served by HuggingFace's Text Embeddings Inference server. The adapters ship in the extension, and `hf_tei_reranking` is referenced from the hybrid-search documentation, **but on some builds no foreign server is registered for them**, in which case `aidb.create_model()` fails with `Model provider with name "hf_tei" not found`.
 
-The OCR NIM provider is registered as `nim_paddle_ocr`; the docs' config helper for it is `aidb.nim_ocr_config()`.
+Rule: run the availability check above and only offer TEI if the server is present. If it is absent, say so plainly and offer `llamacpp_embeddings` / `embeddings` (a TEI endpoint that speaks the OpenAI embeddings API) or `nim_reranking` / `llamacpp_reranking` as alternatives.
 
-Choosing between OpenAI providers: `openai_responses` for agentic/tool-calling work (native tool calls); `openai_completions` for plain generation (simulates tool calls via prompt injection when backing an agent). `openrouter_chat` is a gateway to many vendors using OpenRouter slugs, also with simulated tool calling.
+There is no config helper for TEI — build `config` with `jsonb_build_object()`. Recognized keys and their defaults: `url` (`http://localhost:8080`; the adapter appends `/embed`), `normalize` (`true`), `truncate` (`true`), `truncation_direction` (`Right` or `Left`), `max_concurrent_requests` (`25`), `max_batch_size` (`32`), `tls_config`. Authentication is sent as a bearer/basic header from `credentials`/`credentials_env` — never from `config`.
+
+#### Choosing between overlapping providers
+
+- `openai_responses` for agentic/tool-calling work (native tool calls); `openai_completions` for plain generation (simulates tool calls via prompt injection when backing an agent).
+- `openrouter_chat` is a gateway to many vendors using OpenRouter slugs, also with simulated tool calling.
+- The OCR NIM provider is registered as `nim_paddle_ocr`; its config helper is `aidb.nim_ocr_config()`.
 
 ### Default models
 
-Registered automatically at `CREATE EXTENSION`, usable with no configuration — again, confirm with `SELECT name, provider FROM aidb.models ORDER BY 1;` rather than assuming:
+Registered automatically at `CREATE EXTENSION`, usable with no configuration. Model files are downloaded on first use (or at `validate` time), so the first call can take minutes.
 
-`bert` (bert_local), `clip` (clip_local), `t5` (t5_local), `llama` (llama_instruct_local), `bge-small-en-v1.5-f16`, `nomic-embed-text-v1.5-Q8_0`, `bge-m3-f16`, `qwen3-embedding-0.6b-Q8_0`, `qwen3-embedding-4b-Q8_0` (all llamacpp_embeddings), `qwen3.5-0.8b-Q8_0`, `llama-3.2-1b-instruct-Q8_0` (llamacpp_generate), `lightonocr-2-1b-Q8_0` (llamacpp_ocr), `dummy` (dummy).
+| Model | Provider | Notes |
+|---|---|---|
+| `bert` | `bert_local` | Text embeddings |
+| `clip` | `clip_local` | Text + image embeddings — the default choice for image KBs |
+| `t5` | `t5_local` | Text-to-text; **cannot back an agent** |
+| `llama` | `llama_instruct_local` | Instruction following |
+| `bge-small-en-v1.5-f16` | `llamacpp_embeddings` | Small/fast; context 512 |
+| `nomic-embed-text-v1.5-Q8_0` | `llamacpp_embeddings` | Context 2048 |
+| `bge-m3-f16` | `llamacpp_embeddings` | Multilingual; context 8192 |
+| `qwen3-embedding-0.6b-Q8_0` | `llamacpp_embeddings` | Context 16384 |
+| `qwen3-embedding-4b-Q8_0` | `llamacpp_embeddings` | Context 20480; largest, slowest |
+| `qwen3.5-0.8b-Q8_0` | `llamacpp_generate` | Generation; supports native tool calls |
+| `llama-3.2-1b-instruct-Q8_0` | `llamacpp_generate` | Generation; supports native tool calls |
+| `lightonocr-2-1b-Q8_0` | `llamacpp_ocr` | Local OCR |
+| `dummy` | `dummy` | Deterministic fake output for testing a pipeline's plumbing |
 
-Context windows differ meaningfully among the embedding defaults, which drives the chunk size you should pair with them:
-
-| Default embedding model | Context window |
-|---|---|
-| `nomic-embed-text-v1.5-Q8_0` | 2048 |
-| `bge-m3-f16` | 8192 |
-| `qwen3-embedding-0.6b-Q8_0` | 16384 |
-| `qwen3-embedding-4b-Q8_0` | 20480 |
+Default-model selection guidance: `bge-small-en-v1.5-f16` for short English text (fastest), `bge-m3-f16` for multilingual or longer chunks, `qwen3-embedding-*` when chunks are large. Chunk sizes larger than the model's context window are silently truncated by the server — size `chunk_text` to fit.
 
 ## Config helpers
 
-Each returns `JSONB` for the `config` argument of `aidb.create_model()`.
+Each returns `JSONB` for the `config` argument of `aidb.create_model()`. Leave every `api_key`/`basic_auth` parameter NULL (see the credentials rule above).
 
 ### `aidb.embeddings_config` — `openai_embeddings` and OpenAI-compatible embeddings
 
@@ -206,8 +251,6 @@ Each returns `JSONB` for the `config` argument of `aidb.create_model()`.
 ### `aidb.completions_config` — `openai_completions` and OpenAI-compatible completions
 
 `model` (TEXT, required), `api_key`, `url`, `basic_auth`, `system_prompt`, `temperature` (DOUBLE PRECISION), `top_p` (DOUBLE PRECISION), `seed` (BIGINT), `thinking` (BOOLEAN), `max_tokens` (JSONB — use `aidb.max_tokens_config()`), `max_concurrent_requests` (INTEGER), `extra_args` (JSONB), `is_hcp_model` (BOOLEAN).
-
-> The `api_key` / `basic_auth` parameters exist on these helpers for backward compatibility. Leave them unset: `create_model()` rejects a config carrying them, and the handling rule above applies.
 
 ### `aidb.max_tokens_config`
 
@@ -223,7 +266,7 @@ Each returns `JSONB` for the `config` argument of `aidb.create_model()`.
 
 `model` (TEXT, required), `api_key`, `basic_auth`, `url`, `max_concurrent_requests` (INTEGER, default `25`), `system_prompt` (sent as native `system`), `temperature`, `max_tokens` (INTEGER, default `4096` — Anthropic requires it), `top_p`, `extra_args` (JSONB).
 
-`url` defaults to `api.anthropic.com`; **required** for `_azure` (resource Messages endpoint) and `_bedrock` (regional `bedrock-runtime` base URL — the model ID is appended automatically). For `_bedrock`, `api_key` is a Bedrock bearer token, not an AWS SigV4 credential.
+`url` defaults to `api.anthropic.com`; **required** for `_azure` (resource Messages endpoint) and `_bedrock` (regional `bedrock-runtime` base URL — the model ID is appended automatically). For `_bedrock`, the credential is a Bedrock bearer token, not an AWS SigV4 credential.
 
 ### `aidb.bert_config` — `bert_local`
 
@@ -243,7 +286,15 @@ Each returns `JSONB` for the `config` argument of `aidb.create_model()`.
 
 ### `aidb.gemini_config` — `gemini`
 
-`api_key` (TEXT, required), `model`, `url`, `max_concurrent_requests` (INTEGER), `thinking_budget` (INTEGER, Gemini 2.x only). See the handling rule under "Leaked credentials" before using `api_key`.
+`api_key` (TEXT, **required parameter — pass NULL**), `model`, `url`, `max_concurrent_requests` (INTEGER), `thinking_budget` (INTEGER, Gemini 2.x only).
+
+```sql
+SELECT aidb.create_model(
+    'gemini_flash',
+    'gemini',
+    config          => aidb.gemini_config(api_key => NULL, model => 'gemini-2.0-flash'),
+    credentials_env => 'AIDB_GEMINI_API_KEY');
+```
 
 ### `aidb.nim_clip_config`, `aidb.nim_ocr_config`, `aidb.nim_reranking_config`
 
@@ -257,4 +308,38 @@ All take the same shape: `api_key`, `model`, `url`, `basic_auth`, `is_hcp_model`
 
 `model` (TEXT, required), `api_key`, `url`, `max_concurrent_requests` (INTEGER), `max_batch_size` (INTEGER).
 
-The llama.cpp providers have no dedicated helper — build their `config` with `jsonb_build_object()`.
+The llama.cpp and TEI providers have no dedicated helper — build their `config` with `jsonb_build_object()`. Keys used by the pre-registered llama.cpp models: `hf_model`, `model_file`, `mmproj_file` (OCR), `revision`, `n_ctx`, `query_prefix`, `document_prefix`, `temperature`, `top_p`.
+
+## Worked examples
+
+```sql
+-- Remote generation model, secret never stored:
+--   export AIDB_OPENAI_API_KEY=sk-...   (in the Postgres server environment)
+SELECT aidb.create_model(
+    'gpt_4o',
+    'openai_responses',
+    config          => aidb.openai_responses_config(model => 'gpt-4o'),
+    credentials_env => 'AIDB_OPENAI_API_KEY');
+
+-- Fully local embedding model, nothing leaves the database:
+SELECT aidb.create_model(
+    'local_embed',
+    'llamacpp_embeddings',
+    config => jsonb_build_object(
+        'hf_model',   'CompendiumLabs/bge-m3-gguf',
+        'model_file', 'bge-m3-f16.gguf',
+        'n_ctx',      8192),
+    validate => false);   -- defer the model download
+SELECT aidb.validate_model('local_embed');
+```
+
+## Common errors
+
+| Message | Cause / fix |
+|---|---|
+| `Model provider with name "X" not found` | Not registered on this build. Re-check `aidb.model_providers` |
+| `config must not contain "api_key" or "basic_auth"` | Move the secret to `credentials_env` / `credentials` |
+| `Credentials for model provider "X" already exist` | Credentials are per provider; re-use them (omit the argument) or pass `replace_credentials => true` |
+| `Only one of "credentials", "credentials_env", ... may be provided` | They are mutually exclusive |
+| `... does not start with the required prefix` | `credentials_env` name must start with `aidb.env_var_allowed_prefix` (`AIDB_`) |
+| `Failed to create model: ...` with a `validate => false` hint | The probe inference failed — bad URL, key, or model name |

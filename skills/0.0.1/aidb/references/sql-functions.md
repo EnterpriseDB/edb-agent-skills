@@ -4,6 +4,38 @@ Signature reference for transformation functions callable directly in a query, w
 
 Every pipeline step operation is also available as a standalone function. Inference functions (`encode_text`, `generate_text`, `rerank_text`) are in `models.md`.
 
+## Installation and runtime check
+
+Run this first on an unfamiliar database — it tells you whether AIDB is installed, at what version, and how it is configured.
+
+```sql
+-- Extension presence and version (pgvector and pgfs matter for KBs and volumes)
+SELECT extname, extversion FROM pg_extension
+WHERE extname IN ('aidb', 'vector', 'pgfs', 'vchord') ORDER BY extname;
+
+-- All AIDB GUCs. An empty result means the library is not loaded
+-- (add `aidb` to shared_preload_libraries and restart).
+SELECT name, setting, context, short_desc FROM pg_settings
+WHERE name LIKE 'aidb.%' ORDER BY name;
+
+-- Does the current role have AIDB access?
+SELECT current_user, pg_has_role(current_user, 'aidb_users', 'MEMBER') AS in_aidb_users;
+```
+
+Runtime GUCs and what they gate:
+
+| GUC | Effect |
+|---|---|
+| `aidb.max_threads` | Model thread pool. **Changing it requires a database restart** |
+| `aidb.max_io_threads` | I/O thread pool |
+| `aidb.egress_allowlist` | Outbound host/CIDR allowlist covering model endpoints, MCP servers, and model downloads. A blocked host looks like a network error |
+| `aidb.env_var_allowed_prefix` | Prefix (default `AIDB_`) that `credentials_env` and `headers_env` names must start with |
+| `aidb.download_log_level`, `aidb.download_max_attempts` | Model download logging/retries |
+| `aidb.enable_llamacpp_logs` | llama.cpp logging |
+| `aidb.pipeline_error_warnings` | Also emit a `WARNING` for each logged pipeline error (default on) |
+
+Installation summary: add `aidb` to `shared_preload_libraries`, restart, then `CREATE EXTENSION aidb CASCADE;`. Supported on PostgreSQL 14–18 (community, EDB Postgres Advanced Server, EDB Postgres Extended). Access is managed through the `aidb_users` role.
+
 ## `aidb.chunk_text`
 
 `aidb.chunk_text(input TEXT, options JSONB)` → `TABLE(part_id bigint, chunk text)`
@@ -95,6 +127,28 @@ Not covered by the docs' reference pages, but present in the extension and expos
 | `aidb.encode_text_query_batch` | `(model_name TEXT, input TEXT[])` → `SETOF real[]` | Batch form, input order preserved |
 
 When embedding a query against a specific knowledge base, prefer `aidb.kb_query_encode(kb_name, query)` — it resolves the KB's own model for you. See `knowledge-bases.md`.
+
+## Worked examples
+
+```sql
+-- Chunk a column on the fly, no pipeline involved
+SELECT d.id, c.part_id, c.chunk
+FROM documents d,
+     LATERAL aidb.chunk_text(d.body, aidb.chunk_text_config(desired_length => 300)) c
+LIMIT 20;
+
+-- Summarize per group
+SELECT customer_id,
+       aidb.summarize_text_aggregate(note ORDER BY created_at,
+           aidb.summarize_text_config(model => 'llama-3.2-1b-instruct-Q8_0')::json) AS summary
+FROM support_notes GROUP BY customer_id;
+
+-- Generate with a per-call override
+SELECT aidb.generate_text('llama-3.2-1b-instruct-Q8_0', 'Explain vector search in one sentence.',
+         aidb.inference_config(temperature => 0.0, max_tokens => 120)::json);
+```
+
+Scale note: these run inference per row. Try them on a handful of rows (`LIMIT`) before running over a whole table, and use a pipeline when the results should be stored and kept up to date.
 
 ## Defaults quick reference
 

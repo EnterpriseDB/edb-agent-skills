@@ -4,11 +4,62 @@ Signature reference for pipeline types, views, CRUD, step operations, and the er
 
 A pipeline reads from a source, applies up to 10 ordered steps, and writes to a destination.
 
+## Discovery queries — run these before advising
+
+```sql
+-- What pipelines exist, and how are they wired?
+SELECT name, source_type, source_schema, source, source_key_column, source_data_column,
+       destination_type, destination, auto_processing, steps
+FROM aidb.pipelines ORDER BY name;
+
+-- Health of every pipeline (column names contain spaces -- quote them)
+SELECT pipeline, "auto processing", "Status", "count(source records)",
+       "count(destination records)", "count(record errors)", "count(blocking errors)",
+       "last run completed"
+FROM aidb.pipeline_metrics ORDER BY pipeline;
+
+-- Outstanding errors, all pipelines
+SELECT * FROM aidb.get_all_error_summaries();
+
+-- Detail for one pipeline
+SELECT * FROM aidb.get_error_logs(p_pipeline_name => 'my_pipeline', p_limit => 50);
+```
+
+## Step sequencing and type compatibility
+
+Data moves between steps as one of three envelope types: **Text**, **Bytes** (binary: PDFs, images), or **Vector**. A step whose input type differs from the previous step's output type is an invalid sequence and is rejected at pipeline creation time. The source's `PipelineDataFormat` sets the type entering step 1 (`Text` → Text, `Image`/`Pdf` → Bytes).
+
+| Step operation | Consumes | Produces | Row fan-out |
+|---|---|---|---|
+| `ChunkText` | Text | Text | 1 → many (adds `part_id`) |
+| `SummarizeText` | Text | Text | 1 → 1 |
+| `ParseHtml` | Text | Text | 1 → 1 |
+| `ParsePdf` | Bytes | Text | 1 → one row per page |
+| `PdfToImage` | Bytes | Bytes | 1 → one row per page |
+| `PerformOcr` | Bytes | Text | 1 → one row per text block |
+| `KnowledgeBase` | Text *or* Bytes | **Vector** | 1 → 1. **Must be the last step** |
+| `SemanticKB` | (own runnable) | — | Managed by `aidb.create_semantic_kb()`; not composed by hand |
+
+Nothing consumes a Vector, which is why `KnowledgeBase` must be last.
+
+Canonical, valid sequences:
+
+- Text column → `ChunkText` → `KnowledgeBase`
+- HTML column → `ParseHtml` → `ChunkText` → `KnowledgeBase`
+- Digital PDF volume → `ParsePdf` → `ChunkText` → `KnowledgeBase`
+- Scanned PDF volume → `PdfToImage` → `PerformOcr` → `ChunkText` → `KnowledgeBase`
+- Long text → `SummarizeText` → `KnowledgeBase`
+- Image volume → `KnowledgeBase` (with `data_format => 'Image'` and an image-capable model such as `clip`)
+
+Invalid, and why: `ChunkText` directly on a PDF volume (Bytes into a Text step); `PerformOcr` after `ParsePdf` (Text into a Bytes step); any step after `KnowledgeBase`.
+
 ## Types
 
 ### `aidb.PipelineAutoProcessingMode`
 
 `Live` (Postgres triggers, synchronous on write) | `Background` (background worker, batched) | `Disabled` (manual via `aidb.run_pipeline()`).
+
+Choosing: `Live` for small/low-latency tables where writes can absorb an inference call; `Background` for bulk or volume sources; `Disabled` when the user wants full control (also the safest default for a first build).
 
 ### `aidb.PipelineDataFormat`
 
@@ -54,6 +105,8 @@ Two dimensions — scope (record vs pipeline) and temporality.
 
 `L2` (default) | `InnerProduct` | `Cosine` | `L1` | `Hamming` | `Jaccard`.
 
+SQL operators: `L2` `<->`, `InnerProduct` `<#>`, `Cosine` `<=>`, `L1` `<+>`, `Hamming` `<~>`, `Jaccard` `<%>`. Read `distance_operator_sql` from `aidb.knowledge_bases` rather than hardcoding.
+
 ## Domains
 
 - `aidb.pipeline_name_50` — TEXT, max 50 characters.
@@ -90,6 +143,8 @@ Column names contain spaces and must be quoted: `pipeline`, `"auto processing"`,
 | `step_2_options` … `step_10_options` | JSONB | NULL | Configs for steps 2–10 |
 
 Returns `name`, `destination_type`, `destination_schema`, `destination`, `destination_key_column`, `destination_data_column`.
+
+Creation-time validation covers: step count (≤10), step sequencing/type compatibility, `KnowledgeBase` being last, the destination table not already existing (unless it is a registered KB vector table), and that every referenced model exists and is capable. Models are **not** re-validated at execution time.
 
 ### Other functions
 
@@ -131,7 +186,7 @@ Must be an object with an `enabled` key — any other JSON type errors at pipeli
 | `overlap_length` | INTEGER | NULL | Overlap between consecutive chunks. Defaults to 0 |
 | `strategy` | TEXT | NULL | `'chars'` (default) or `'words'` |
 
-Introduces a `part_id` column; one source row may produce many output rows.
+Introduces a `part_id` column; one source row may produce many output rows. Keep `desired_length` inside the embedding model's context window (see the default-model table in `models.md`).
 
 ### `ParseHtml` — `aidb.html_parse_config()`
 
@@ -158,7 +213,7 @@ Unnests: one row per page, `part_id` = zero-based page index. Use for scanned or
 
 ### `PerformOcr` — `aidb.ocr_config()`
 
-`model` (TEXT, required) — a registered OCR-capable model (e.g. provider `nim_paddle_ocr`, `nim_ocr`, or local `llamacpp_ocr`).
+`model` (TEXT, required) — a registered OCR-capable model (provider `nim_paddle_ocr` or local `llamacpp_ocr`; the default `lightonocr-2-1b-Q8_0` works out of the box).
 
 ### `SummarizeText` — `aidb.summarize_text_config()`
 
@@ -188,7 +243,7 @@ Destination table defaults to `pipeline_<pipeline_name>`. Shape: `id` (BIGSERIAL
 
 ### `SemanticKB`
 
-Indexes schema metadata into a semantic knowledge base. See `knowledge-bases.md`.
+Indexes schema metadata into a semantic knowledge base. Created and managed through `aidb.create_semantic_kb()` — see `knowledge-bases.md`. Do not hand-author a `SemanticKB` step.
 
 ### `aidb.inference_config` in steps
 
@@ -230,3 +285,51 @@ Each pipeline has an error log table at `{source_schema}.pipeline_{pipeline_name
 ## GUC
 
 `aidb.pipeline_error_warnings` — boolean, default `true`, context `SUSET`. When on, each logged error also emits a Postgres `WARNING`. Errors persist to the log either way. Non-superusers need `GRANT SET ON PARAMETER aidb.pipeline_error_warnings` before they can `SET` it.
+
+## Worked examples
+
+```sql
+-- 1. Text column -> chunks -> embeddings (manual runs while testing)
+SELECT aidb.create_pipeline(
+    name               => 'docs_rag',
+    source             => 'public.documents',
+    source_key_column  => 'id',
+    source_data_column => 'body',
+    auto_processing    => 'Disabled',
+    step_1             => 'ChunkText',
+    step_1_options     => aidb.chunk_text_config(desired_length => 400, overlap_length => 40),
+    step_2             => 'KnowledgeBase',
+    step_2_options     => aidb.knowledge_base_config(
+                              model             => 'bge-m3-f16',
+                              data_format       => 'Text',
+                              distance_operator => 'Cosine'));
+SELECT aidb.run_pipeline('docs_rag');
+SELECT * FROM aidb.get_pipeline_metrics('docs_rag');
+
+-- 2. Scanned PDFs on a volume -> images -> OCR -> chunks -> embeddings
+SELECT aidb.create_pipeline(
+    name            => 'scans_rag',
+    source          => 'public.scanned_pdfs',           -- a volume
+    auto_processing => 'Background',
+    background_sync_interval => '5 minutes',
+    step_1          => 'PdfToImage',
+    step_1_options  => '{"dpi": 300, "format": {"type": "png"}}'::jsonb,
+    step_2          => 'PerformOcr',
+    step_2_options  => aidb.ocr_config(model => 'lightonocr-2-1b-Q8_0'),
+    step_3          => 'ChunkText',
+    step_3_options  => aidb.chunk_text_config(desired_length => 500),
+    step_4          => 'KnowledgeBase',
+    step_4_options  => aidb.knowledge_base_config(model => 'bge-m3-f16', data_format => 'Text'));
+```
+
+## Common errors
+
+| Message / symptom | Cause / fix |
+|---|---|
+| Destination table already exists | Choose another `destination`, or drop it. Only a registered KB vector table may be reused |
+| Step sequence rejected at creation | Type mismatch — check the compatibility table above |
+| Pipeline name too long | `create_pipeline` caps `name` at 46 characters |
+| Status stays `Stale` | `auto_processing => 'Disabled'` — call `aidb.run_pipeline()` |
+| Status `NoResults` | Source empty, or `source_data_column` points at the wrong column |
+| Status `BlockingErrors` | Fix the cause (model deleted, network), re-run, then `aidb.clear_error_logs()` |
+| Changing steps has no effect | `update_pipeline` only changes auto-processing; recreate the pipeline instead |

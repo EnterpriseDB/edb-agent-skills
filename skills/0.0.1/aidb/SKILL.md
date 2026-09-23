@@ -1,487 +1,320 @@
 ---
 name: aidb
-description: Operate EDB AIDB (Postgres extension, target 7.6.0) entirely from SQL — register local/remote AI models, build pipelines that parse/chunk/OCR/summarize/embed data into pgvector knowledge bases, run semantic and hybrid search, index schema metadata for text-to-SQL, register SQL/MCP tools, and build in-database agents. Use this skill whenever the user mentions aidb, ai-factory, AI Factory, aidb.create_model/create_pipeline/create_agent, aidb.retrieve_text, knowledge bases, semantic knowledge bases, semantic aliases, aidb.tools/run_tool, MCP tools in Postgres, or RAG/embeddings/agents inside EDB Postgres.
+description: >-
+  Operate EDB AIDB (aidb, also shipped as part of EDB AI Factory / Hybrid Manager) — the
+  in-database AI extension for PostgreSQL, driven entirely from SQL. Trigger when the user
+  mentions aidb, ai-factory, aidb.* SQL functions, or asks to: build RAG or semantic search
+  inside Postgres; register or debug AI models (OpenAI, Anthropic, NVIDIA NIM, Gemini,
+  OpenRouter, HuggingFace TEI, llama.cpp/Candle local models); create pipelines that chunk,
+  parse HTML/PDF, render PDFs to images, OCR, summarize or embed; query vector knowledge
+  bases with aidb.retrieve_text/aidb.retrieve_key or hybrid vector+full-text search; ingest
+  from S3/GCS/Azure/local files via PGFS volumes; build semantic knowledge bases for schema
+  discovery and text-to-SQL; create in-database agents, custom SQL tools, import tools from
+  an external MCP server, or expose AIDB's own tool catalog to external agents over MCP.
+  Supplies discovery queries, exact signatures, safety rules (always confirm before acting;
+  never store an API key in a model's config) and troubleshooting.
 metadata:
-  version: "1.0.0"
-  target_product: "EDB AIDB 7.6.0"
   aliases: "aidb, ai-factory"
-  postgres_support: "PostgreSQL 14-18, EDB Postgres Advanced Server, EDB Postgres Extended"
+  target_version: "7.6.0"
+  surface: "SQL only - no separate service, API or SDK"
 ---
 
-# AIDB — AI workflows inside Postgres
+# AIDB — in-database AI for PostgreSQL
 
-AIDB is an EDB-maintained Postgres extension. **Everything is SQL** — there is no separate
-service, API, or SDK. It runs inside Postgres, has no runtime dependency on Agent Factory or
-Hybrid Manager (though it ships with them), and with a local model no data leaves the database.
+## §1 Scope
 
-Installed with `shared_preload_libraries = 'aidb'` → restart → `CREATE EXTENSION aidb CASCADE;`
-(`CASCADE` pulls in `vector`). `CREATE EXTENSION pgfs;` adds S3/GCS/Azure/local volumes. Access is
-granted through the **`aidb_users`** role (`GRANT aidb_users TO alice;`) — which grants the AIDB API,
-*not* the user's own tables; grant table privileges separately.
+AIDB is an EDB-maintained PostgreSQL extension. **Every capability is a SQL call in the `aidb`
+schema** — there is no CLI, REST API or SDK to drive. It runs inside Postgres (14–18: community,
+EDB Postgres Advanced Server, EDB Postgres Extended) and has no runtime dependency on Agent
+Factory or Hybrid Manager, even though it ships with them. With a local model, neither the data
+nor the inference leaves the database.
 
-## The four building blocks
+Building blocks, in the order users usually meet them:
 
-| Block | What it is |
-|---|---|
-| **Pipelines** | Declarative ≤10-step workflows: parse, chunk, OCR, summarize, embed. Run manually, on a background worker, or on trigger. |
-| **Knowledge bases** | The output of a pipeline's `KnowledgeBase` step: a pgvector table queried with `aidb.retrieve_text()` / `aidb.retrieve_key()` or hybrid search. |
-| **Agents** *(7.6.0)* | Named config of instructions + model + allowed tools, run in a ReAct loop. Can delegate to other agents. |
-| **Tools** *(7.6.0)* | What an agent calls: native tools, your parameterized SQL, or tools imported from an MCP server. All unified in `aidb.tools`. |
+| Block | What it is | Reference |
+|---|---|---|
+| Standalone SQL functions | `chunk_text`, `parse_html`, `parse_pdf`, `pdf_to_image`, `perform_ocr`, `summarize_text`, plus inference | [sql-functions.md](references/sql-functions.md) |
+| Models | Registered once by name, reused everywhere; local or remote | [models.md](references/models.md) |
+| Pipelines | Up to 10 declarative steps: parse → chunk → OCR → summarize → embed | [pipelines.md](references/pipelines.md) |
+| Knowledge bases | A pipeline's embedding output, pgvector-indexed and queryable | [knowledge-bases.md](references/knowledge-bases.md) |
+| Tools | Native tools, your parameterized SQL queries, imported MCP tools — one catalog | [tools.md](references/tools.md) |
+| Agents | Instructions + model + allowed tools, run in a ReAct loop; can delegate | [agents.md](references/agents.md) |
 
-Every pipeline step operation is **also** a standalone SQL function — no pipeline required.
+Every pipeline step operation is *also* a standalone function, so a user can try a transformation
+in one query before committing to a pipeline.
 
-### Two different things are called "knowledge base" — never conflate them
+## §2 Get a connection, run SQL, then verify
+
+The skill's whole output is SQL. Before promising any action, establish **how** you will run it.
+
+**2.1 Find an execution channel, in this order:**
+
+1. A Postgres MCP tool / database tool already available to you (e.g. one that executes queries
+   against a configured database) — prefer it, and confirm which database it points at.
+2. A `psql` binary plus a connection: an explicit connection string from the user, `DATABASE_URL`,
+   `PGSERVICE` (`psql "service=$PGSERVICE"`), or standard libpq env vars
+   (`PGHOST`/`PGPORT`/`PGUSER`/`PGDATABASE`). Run non-interactively and fail fast:
+   `psql "<conn>" -v ON_ERROR_STOP=1 -P pager=off -f -`.
+3. Ask the user. Request: host/port or connection string, database, and the **role** to run as
+   (AIDB access is granted through the `aidb_users` role). Ask before, not after.
+
+**2.2 If no channel exists**, say so plainly and switch to advisory mode: print the exact SQL in a
+copy-pasteable block for the user to run, and ask them to paste back the output. **Never report
+that an object was created, a pipeline ran, or a model was registered unless you saw the result of
+the statement.** Do not narrate success you did not observe.
+
+**2.3 Preflight (read-only) — run on any unfamiliar database before advising:**
+
+```sql
+-- Is it installed, at what version, with what companions?
+SELECT extname, extversion FROM pg_extension
+WHERE extname IN ('aidb','vector','pgfs','vchord') ORDER BY extname;
+
+-- Is the library loaded, and how is it configured? Empty result => aidb is not in
+-- shared_preload_libraries (add it and restart), so nothing below will work.
+SELECT name, setting, context FROM pg_settings WHERE name LIKE 'aidb.%' ORDER BY name;
+
+-- Can this role use AIDB? Is this a replica (agents auto-run read-only there)?
+SELECT current_user, current_database(),
+       pg_has_role(current_user,'aidb_users','MEMBER') AS in_aidb_users,
+       pg_is_in_recovery() AS is_read_replica;
+```
+
+**2.4 Version drift — mandatory rule.** This skill and every file in `references/` document
+**AIDB 7.6.0**. Compare `extversion` to `7.6.0`:
+
+* **Equal** → the references apply as written.
+* **Different (older or newer)** → tell the user explicitly: *"This installation is AIDB
+  `<extversion>`; the signatures, providers, native tools and config helpers in my reference set
+  are for 7.6.0 and may not match."* Then **verify before proposing any call**:
+
+```sql
+-- Real signatures on THIS installation (never propose a call you have not confirmed here)
+SELECT p.proname, pg_get_function_arguments(p.oid) AS arguments,
+       pg_get_function_result(p.oid) AS returns
+FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+WHERE n.nspname = 'aidb' AND p.proname = 'create_model';   -- swap in the function you need
+
+SELECT server_name FROM aidb.model_providers ORDER BY server_name;  -- real providers
+SELECT name, provider, functions FROM aidb.models ORDER BY provider, name;  -- real models
+SELECT name, tool_type, read_only FROM aidb.tools ORDER BY tool_type, name; -- real tools
+```
+
+Anything you cannot confirm in `pg_proc` or the live catalogs must be described as "documented for
+7.6.0, not present here" rather than offered.
+
+**2.5 Inventory of what exists** (run once per session before recommending anything; each view is
+documented in the reference named beside it):
+
+```sql
+SELECT server_name, server_description FROM aidb.model_providers ORDER BY server_name; -- models.md
+SELECT name, provider, functions FROM aidb.models ORDER BY provider, name;             -- models.md
+SELECT * FROM aidb.audit_leaked_credentials();                                         -- models.md
+SELECT name, source_type, source, destination_type, destination, auto_processing, steps
+  FROM aidb.pipelines ORDER BY name;                                                   -- pipelines.md
+SELECT pipeline, "auto processing", "Status", "count(record errors)",
+       "count(blocking errors)", "last run completed"
+  FROM aidb.pipeline_metrics ORDER BY pipeline;                                        -- pipelines.md
+SELECT * FROM aidb.get_all_error_summaries();                                          -- pipelines.md
+SELECT name, vector_schema, vector_table, model_name, distance_operator,
+       distance_operator_sql, pipeline_names FROM aidb.knowledge_bases ORDER BY name;  -- knowledge-bases.md
+SELECT name, pipelines, embeddings, status FROM aidb.knowledge_base_metrics ORDER BY name;
+SELECT schema, volume, storage_location, path FROM aidb.volumes ORDER BY schema, volume;
+SELECT * FROM aidb.list_semantic_kbs();                                                -- knowledge-bases.md
+SELECT name, description, param_count FROM aidb.get_semantic_aliases() ORDER BY name;
+SELECT name, tool_type, read_only, description FROM aidb.tools ORDER BY tool_type, name;-- tools.md
+SELECT name, model, role, tools, delegates, max_iterations, timeout_seconds,
+       budget_strategy FROM aidb.agents ORDER BY name;                                 -- agents.md
+SELECT * FROM aidb.agent_tasks ORDER BY created_at DESC LIMIT 20;                      -- agents.md
+```
+
+The installed catalogs are the authority. The tables in `references/` are 7.6.0 stock defaults.
+
+## §3 Routing table — intent to reference
+
+Load **one** reference file on demand; do not preload them all.
+
+| User intent | Go to | Key entry points |
+|---|---|---|
+| Install / check / configure AIDB, GUCs, `aidb_users` | [sql-functions.md](references/sql-functions.md) | `CREATE EXTENSION aidb CASCADE`, `aidb.egress_allowlist`, `aidb.max_threads` |
+| One-off AI in a query: chunk, parse HTML/PDF, PDF→image, OCR, summarize | [sql-functions.md](references/sql-functions.md) | `aidb.chunk_text`, `aidb.parse_pdf`, `aidb.pdf_to_image`, `aidb.perform_ocr`, `aidb.summarize_text`, `aidb.summarize_text_aggregate` |
+| Register a model, pick a provider, handle credentials | [models.md](references/models.md) | `aidb.create_model`, `credentials_env`, `aidb.validate_model`, config helpers |
+| Embed / generate / rerank directly | [models.md](references/models.md) | `aidb.encode_text`, `aidb.generate_text`, `aidb.rerank_text`, `aidb.inference_config` |
+| Audit stored credentials for leaked secrets | [models.md](references/models.md) | `aidb.audit_leaked_credentials()` |
+| Build ingestion / RAG indexing, auto-processing modes | [pipelines.md](references/pipelines.md) | `aidb.create_pipeline`, step configs, `aidb.run_pipeline` |
+| Pipeline health, errors, retries | [pipelines.md](references/pipelines.md) | `aidb.pipeline_metrics`, `aidb.get_error_logs`, `aidb.get_error_log_summary`, `aidb.get_all_error_summaries`, `aidb.requeue_pipeline_errors`, `aidb.clear_error_logs` |
+| Query a vector KB; hybrid vector + full-text search | [knowledge-bases.md](references/knowledge-bases.md) | `aidb.retrieve_text`, `aidb.retrieve_key`, `aidb.kb_query_encode`, `aidb.rerank_text` |
+| Ingest files from S3/GCS/Azure/local (volumes) | [knowledge-bases.md](references/knowledge-bases.md) | `aidb.create_volume`, `aidb.volumes`, `aidb.delete_volume` |
+| Schema discovery / text-to-SQL / reusable parameterized queries | [knowledge-bases.md](references/knowledge-bases.md) | `aidb.create_semantic_kb`, `aidb.semantic_kb_search`, `aidb.get_column_definitions`, `aidb.create_semantic_alias`, `aidb.execute_semantic_alias` |
+| Create / run / debug an agent, budgets, delegation, roles | [agents.md](references/agents.md) | `aidb.create_agent`, `aidb.agent_converse`, `aidb.agents`, `aidb.agent_tasks`, `aidb.conversation_log` |
+| Custom SQL tool; native tool catalog; test a tool | [tools.md](references/tools.md) | `aidb.create_sql_tool`, `aidb.tool_param(s)`, `aidb.run_tool`, `aidb.tools` |
+| **Import** tools from an external MCP server into AIDB | [tools.md](references/tools.md) | `aidb.import_mcp_tools`, `aidb.refresh_mcp_tools`, `aidb.mcp_registry`, `headers_env` |
+| **Expose / serve** AIDB's whole tool catalog to an external agent over MCP | [tools.md](references/tools.md) | `aidb.get_mcp_tools()` — the MCP `tools/list`-shaped descriptor of every native, SQL and MCP tool; `aidb.run_tool()` backs the dispatch |
+| Delete things safely (model, pipeline, KB, volume, tool, agent) | matching reference | `aidb.delete_model`, `aidb.delete_pipeline`, `aidb.delete_knowledge_base`, `aidb.delete_volume`, `aidb.delete_tool`, `aidb.delete_agent` |
+
+**Serving note.** `aidb.get_mcp_tools()` (see [tools.md](references/tools.md)) is the in-database
+half of MCP serving: it renders every row of `aidb.tools` as an MCP tool descriptor, and a call is
+dispatched as `aidb.run_tool(name, args)` under the caller's own Postgres role, so `aidb_users`
+membership and table grants remain the security boundary. The HTTP listener itself is a
+product-level component configured outside the `aidb` schema (GUCs beginning `edb.endpoints_mcp`).
+That listener config is **not** covered by `references/`; before asserting anything about it,
+verify on the target and report only what you see:
+`SELECT name, setting, context FROM pg_settings WHERE name LIKE 'edb.endpoints_mcp%' ORDER BY name;`
+If the result is empty, tell the user this build exposes no such endpoint and that
+`aidb.get_mcp_tools()` / `aidb.run_tool()` are still available to any MCP bridge they run themselves.
+
+## §4 Binding rules
+
+1. **Never act immediately.** Summarize the intended action, show the SQL, get explicit
+   confirmation, then run it. This applies to every `create_*`, `update_*`, `delete_*`,
+   `run_pipeline`, `import_mcp_tools` and `agent_converse` call.
+2. **Print the SQL verbatim before executing it. And let the user confirm.** One fenced block, exactly what will run. Ask the user to confirm before executing it.
+3. **Never invent** a function, parameter, provider, model, tool or view name. If it is not in
+   `references/` *and* not confirmed on the target, say "I can't confirm that exists here."
+4. **Verify against the installation, not memory** — §2.5. Offer only providers in
+   `aidb.model_providers`, models in `aidb.models`, tools in `aidb.tools`, agents in `aidb.agents`.
+5. **Secrets never go in a model's `config`.** Use `credentials`, or better `credentials_env` (the
+   variable name is stored, never the value; it must start with `aidb.env_var_allowed_prefix`,
+   `AIDB_` by default). 7.6.0 rejects `api_key`/`basic_auth` anywhere in `config`. A third,
+   build-dependent option, `credentials_k8s_secret`, exists on some builds — [models.md](references/models.md)
+   requires you to confirm it in `pg_proc` before offering it. Quirk: `aidb.gemini_config()` has a
+   *required* `api_key` parameter — pass `api_key => NULL` and supply the key via `credentials_env`.
+6. **Destructive calls get an explicit warning** naming what cascades — above all
+   `aidb.delete_knowledge_base()` (deletes every attached pipeline and drops the vector table) and
+   `aidb.delete_tool()` on an MCP server registration (removes every tool that server advertised).
+7. **Read-only first.** Prefer `read_only => true` when demonstrating an agent; prefer
+   `auto_processing => 'Disabled'` plus a manual `aidb.run_pipeline()` for a first build.
+
+## §5 Guided create flows (the core of this skill)
+
+`create_pipeline`, `create_model`, `create_agent`, `create_sql_tool`, `create_semantic_kb`,
+`create_volume` and `import_mcp_tools` all take many arguments. Compile them *with* the user:
+
+1. **Capture hints** from the prompt (table name, file location, "PDFs", "OpenAI", …). Treat them
+   as hints, never as accepted input.
+2. **Fill gaps with informed guesses**, and present each as a numbered multiple choice grounded in
+   what exists here — e.g. embedding model options taken from `aidb.models`, `auto_processing`
+   from `Live` / `Background` / `Disabled`, `distance_operator` from `L2` / `Cosine` /
+   `InnerProduct`, tools from `aidb.tools`.
+3. **Show a filled-in parameter table**, flagging every value you guessed.
+4. **Print the final SQL** and ask for a yes/no.
+5. **Execute** through the §2 channel, then **verify**: `aidb.pipelines` /
+   `aidb.get_pipeline_metrics()` for pipelines, `aidb.models` for models, `aidb.tools` for tools,
+   `aidb.agents` for agents, `aidb.knowledge_bases` for KBs.
+
+Intake checklist per object type:
+
+* **Model** — name; provider (from `aidb.model_providers`); `config` via that provider's helper;
+  credential path (`credentials_env` preferred); `validate` true/false (false to defer a large
+  local download, then `aidb.validate_model()`). Credentials are **per provider**, not per model.
+* **Pipeline** — source (table/view or volume) and, for tables, `source_key_column` +
+  `source_data_column`; the step sequence and its type compatibility; the embedding model and
+  `data_format`; `auto_processing`; name ≤ 46 chars.
+* **Vector KB** — created *by* a pipeline's `KnowledgeBase` step (`aidb.knowledge_base_config`), or
+  attached to an existing KB with `aidb.knowledge_base_config_from_kb`.
+* **Semantic KB** — name, one embedding model, the schemas to crawl, auto-processing.
+* **Agent** — name; instructions (they double as the tool description when it is a delegate);
+  model from the allowed tier; explicit `tools` array (every native tool must be listed except
+  `sleep`); least-privilege `role`; `max_iterations` (≤25), `timeout`, token budgets,
+  `budget_strategy`; optional `output_type`; optional `delegates`.
+* **SQL tool** — unique name across *all* tool types; description; single read-only `SELECT` with
+  `${name}` placeholders; `params` from `aidb.tool_params(aidb.tool_param(...))`; test with
+  `aidb.run_tool()` before granting it to an agent.
+* **Volume** — name (valid unquoted identifier), PGFS server name, path, `data_format`
+  (`Text`/`Image`/`Pdf`). The PGFS storage location must exist first.
+
+Canonical valid step sequences (details and invalid combinations in [pipelines.md](references/pipelines.md)):
+
+```
+text column   -> ChunkText -> KnowledgeBase
+HTML column   -> ParseHtml -> ChunkText -> KnowledgeBase
+digital PDFs  -> ParsePdf -> ChunkText -> KnowledgeBase
+scanned PDFs  -> PdfToImage -> PerformOcr -> ChunkText -> KnowledgeBase
+long text     -> SummarizeText -> KnowledgeBase
+images        -> KnowledgeBase (data_format => 'Image', image-capable model)
+```
+
+## §6 The two "knowledge bases" — never conflate them
 
 | | Vector knowledge base | Semantic knowledge base |
 |---|---|---|
 | Indexes | Your **data** | Your **schema** (tables, views, columns, comments) |
-| Created by | `aidb.create_pipeline()` + `KnowledgeBase` step | `aidb.create_semantic_kb()` |
+| Created by | `aidb.create_pipeline()` + a `KnowledgeBase` step | `aidb.create_semantic_kb()` |
+| Queried with | `aidb.retrieve_text()`, `aidb.retrieve_key()` | `aidb.semantic_kb_search()`, `aidb.get_metadata()`, `aidb.get_column_definitions()`, `aidb.get_entity_definitions()`, `aidb.search_by_comment()` |
 | Answers | "What content is about X?" | "Which table holds X?" — the basis for text-to-SQL |
 
-## Binding rules — follow these on every task
+Ask which one the user means whenever the phrase is ambiguous. Both live in
+[knowledge-bases.md](references/knowledge-bases.md).
 
-1. **Never write without confirmation.** Creating a model, pipeline, agent, tool, volume, or
-   deleting anything: summarize the action, print the SQL, wait for the user to approve.
-2. **Print the exact SQL verbatim before executing it.** Not a paraphrase.
-3. **Emit SQL that runs on any driver.** No psql-only syntax (`:'var'`, `\set`, `\if`) in SQL you
-   intend to execute — use `$1` placeholders and state the binding, or an explicit quoted literal.
-4. **Never invent** a function, parameter, provider, or model name. If it is not in
-   `references/`, say so rather than guessing.
-5. **Verify the installation first** (`aidb.model_providers`, `aidb.models`, `aidb.pipelines`,
-   `aidb.knowledge_bases`, `aidb.tools`, `aidb.agents`) instead of assuming defaults.
-6. **Never put a secret in a model's `config`.** Use `credentials`, or better `credentials_env`
-   (only the variable *name* is stored). 7.6.0 rejects credentials embedded in `config`.
-7. **`aidb.decode_text()` / `decode_text_batch()` are deprecated** — always use
-   `aidb.generate_text()` / `aidb.generate_text_batch()`.
-8. Offer **options** on complex creates (`create_pipeline`: which embedding model, chunk size,
-   index type, auto-processing mode) rather than silently choosing.
+## §7 Constraints to state up front
 
----
+* A pipeline has at most **10 steps**; `create_pipeline` caps the name at **46 characters**.
+* A `KnowledgeBase` step **must be last** — it emits a `VECTOR`, which no step can consume.
+* Step sequences are type-checked (Text / Bytes / Vector) and rejected at creation time.
+* Models are validated at **pipeline creation**, not at execution.
+* `aidb.update_pipeline()` changes only auto-processing settings; steps, source and destination are
+  immutable — recreate the pipeline instead.
+* HNSW supports at most **2000 dimensions**; above that use `aidb.vector_index_disabled_config()`.
+* `aidb.delete_knowledge_base()` cascades to every attached pipeline and drops the vector table;
+  use `aidb.delete_pipeline()` to detach just one.
+* Agents: hard ceilings of **25 reasoning iterations** and **10 delegation levels** always apply;
+  default timeout 300s. Most agent functions return an `error` column instead of raising — always
+  select it.
+* Embedding, reranking, OCR and multimodal-embedding models cannot back an agent; `t5_local` is
+  rejected outright.
+* **MCP tools are always excluded from read-only agent runs** (AIDB cannot verify an external
+  server), and `read_only` runs persist nothing — `conversation_id` comes back NULL.
+* Tool names are unique across native, SQL and MCP tools; **native tools cannot be deleted**.
+* **No native tool authors pipelines** — an agent cannot build a multi-step pipeline itself. Author
+  pipelines from SQL with user confirmation.
+* Outbound calls (model endpoints, MCP servers, model downloads) are gated by
+  `aidb.egress_allowlist`; a blocked host looks like a plain network error.
+* `aidb.max_threads` changes require a **database restart**.
 
-## Step 0 — Preflight (read-only, always run first)
+## §8 Reference map
 
-```sql
-SELECT extname, extversion FROM pg_extension WHERE extname IN ('aidb','vector','pgfs') ORDER BY 1;
-SELECT name, setting, context FROM pg_settings
- WHERE name LIKE 'aidb.%' OR name = 'edb.egress_allowlist' ORDER BY 1;
-SELECT server_name, server_description FROM aidb.model_providers ORDER BY 1;
-SELECT name, provider FROM aidb.models ORDER BY 1;
-SELECT * FROM aidb.audit_leaked_credentials();
-SELECT name, source_type, source, destination, auto_processing FROM aidb.pipelines ORDER BY 1;
-SELECT pipeline, "Status", "count(record errors)", "count(blocking errors)", "last run completed"
-  FROM aidb.pipeline_metrics ORDER BY 1;
-SELECT name, model_name, distance_operator, pipeline_names FROM aidb.knowledge_bases ORDER BY 1;
-SELECT * FROM aidb.list_semantic_kbs();
-SELECT tool_type, count(*) FROM aidb.tools GROUP BY 1 ORDER BY 1;
-SELECT name, model, tools, delegates FROM aidb.agents ORDER BY 1;
-```
+Load on demand; each file is a signature-level reference for AIDB 7.6.0.
 
-Interpretation: any row from `audit_leaked_credentials()` is a real leaked secret — report it and
-propose re-registering that model with `credentials_env`. A pipeline in `Failed`,
-`BlockingErrors`, or `PartialErrors` gets triaged (Workflow F) before anything new is built.
-`aidb.agents` / `aidb.tools` missing ⇒ the installation predates 7.6.0; say so, don't guess.
+* [references/models.md](references/models.md) — providers (local and remote), `aidb.create_model`,
+  the credentials rules (`credentials`, `credentials_env`, build-dependent `credentials_k8s_secret`,
+  `aidb.audit_leaked_credentials()`), inference functions, `inference_config`, tool calling and
+  structured output, every config helper, the stock default models.
+* [references/pipelines.md](references/pipelines.md) — step/type compatibility, enums,
+  `aidb.pipelines` and `aidb.pipeline_metrics`, CRUD, every step option helper, intermediate
+  storage, vector-index helpers, and the error log
+  (`get_error_logs`, `get_error_log_summary`, `get_all_error_summaries`, `clear_error_logs`,
+  `requeue_pipeline_errors`).
+* [references/knowledge-bases.md](references/knowledge-bases.md) — `aidb.knowledge_bases` and
+  `aidb.knowledge_base_metrics`, `retrieve_text`/`retrieve_key`, hybrid-search building blocks
+  (`aidb.kb_query_encode`, RRF pattern), volumes (`create_volume`, `aidb.volumes`, `delete_volume`),
+  and the whole semantic KB + semantic alias surface.
+* [references/agents.md](references/agents.md) — agent CRUD, `agent_converse`, `aidb.agents`,
+  `aidb.agent_tasks`, conversations and sessions, read-only and debug modes, budgets, roles,
+  structured output, delegation.
+* [references/tools.md](references/tools.md) — `aidb.tools`, `aidb.run_tool`, custom SQL tools,
+  MCP **import** (`import_mcp_tools`, `refresh_mcp_tools`, `mcp_registry`), MCP **serving/exposure**
+  of AIDB's own catalog via `aidb.get_mcp_tools()`, and the full native tool catalog by category.
+* [references/sql-functions.md](references/sql-functions.md) — installation and runtime checks,
+  standalone transformations (chunk, parse HTML/PDF, PDF→image, OCR, summarize) and query-side
+  embedding.
 
-### Runtime configuration (all nine `aidb.*` GUCs)
+## §9 Troubleshooting triage
 
-| GUC | Purpose |
+| Symptom | First move |
 |---|---|
-| `aidb.max_threads` | Max CPU threads for **local** model inference (Candle, llama.cpp). `0` = half the CPUs. `SUSET`. |
-| `aidb.max_io_threads` | Max threads for AIDB's async **I/O** runtimes (remote model HTTP, volume/object-store I/O). `0` = `TOKIO_WORKER_THREADS` or one per CPU. `SUSET`. |
-| `aidb.download_log_level` | Channel for HuggingFace download/model-load progress messages: `notice` (default) / `log` / `off`. |
-| `aidb.download_max_attempts` | Cap on total download attempts per model file (default `30`, range 1–500). Lower for fail-fast CI. |
-| `aidb.enable_llamacpp_logs` | Whether llama.cpp's own verbose diagnostics reach the server log. Default `false`. `SUSET`, **read once at extension init — needs a Postgres restart to change**. |
-| `aidb.egress_allowlist` | Outbound host/CIDR allowlist covering model provider calls, MCP servers, and model downloads. Unset ⇒ no restriction. `SUSET`. |
-| `aidb.env_var_allowed_prefix` | Required prefix (default `AIDB_`) for env-var names usable by `credentials_env` / `headers_env`. Superuser-only. |
-| `aidb.pipeline_error_warnings` | When on (default), each logged pipeline error also raises a Postgres `WARNING`. Errors persist to the log either way. `SUSET`. |
-| `aidb.allow_insecure_egress` / `aidb.allow_insecure_tls` | **Dangerous, off by default**: permit plaintext HTTP to loopback/private hosts / skip TLS verification. Never enable in production. |
-
-`edb.egress_allowlist` is the shared cross-extension fallback used when `aidb.egress_allowlist` is
-unset. Thread GUCs apply live (session `SET` immediately; `ALTER SYSTEM` + `pg_reload_conf()`
-propagates); older EDB material describes a restart — a restart is always sufficient.
-
----
-
-## Workflow A — Register a model
-
-Confirm the provider exists first (`SELECT server_name FROM aidb.model_providers ORDER BY 1;`).
-
-```sql
--- Remote: the secret is never persisted; only the variable name is stored.
-SELECT aidb.create_model(
-    name            => 'my-embeddings',
-    provider        => 'openai_embeddings',
-    config          => aidb.embeddings_config(model => 'text-embedding-3-small'),
-    credentials_env => 'AIDB_OPENAI_API_KEY');
-```
-
-```sql
--- Local llama.cpp providers have no config helper: build config with jsonb_build_object().
-SELECT aidb.create_model(
-    name     => 'local-embed',
-    provider => 'llamacpp_embeddings',
-    config   => jsonb_build_object('model', 'unsloth/bge-small-en-v1.5-GGUF',
-                                   'model_file', 'bge-small-en-v1.5-f16.gguf',
-                                   'n_ctx', 512),
-    validate => false);            -- defer the large download
-SELECT aidb.validate_model('local-embed');
-```
-
-Notes: `validate => true` (default) runs a probe inference and registers nothing on failure. The
-env var name must start with `aidb.env_var_allowed_prefix` (`AIDB_`). Default models exist out of
-the box (`bert`, `clip`, `t5`, `llama`, `bge-m3-f16`, `qwen3-embedding-*`, `qwen3.5-0.8b-Q8_0`,
-`lightonocr-2-1b-Q8_0`, `dummy`, …) — confirm with `SELECT name, provider FROM aidb.models`.
-Full provider list, every config helper, `inference_config`, tool calling / structured output,
-and embedding context windows: **[references/models.md](references/models.md)**.
-
-## Workflow B — RAG: pipeline → knowledge base → retrieval
-
-### B1. Create the pipeline (offer the user options before running this)
-
-```sql
-SELECT aidb.create_pipeline(
-    name                     => 'docs_kb',
-    source                   => 'public.documents',
-    source_key_column        => 'id',
-    source_data_column       => 'body',
-    auto_processing          => 'Background',
-    batch_size               => 100,
-    background_sync_interval => INTERVAL '5 minutes',
-    step_1                   => 'ChunkText',
-    step_1_options           => aidb.chunk_text_config(desired_length => 800,
-                                                       overlap_length => 100),
-    step_2                   => 'KnowledgeBase',
-    step_2_options           => aidb.knowledge_base_config(
-                                    model             => 'bge-m3-f16',
-                                    data_format       => 'Text',
-                                    distance_operator => 'Cosine',
-                                    vector_index      => aidb.vector_index_hnsw_config(
-                                                             m => 16, ef_construction => 64)));
-
-SELECT aidb.run_pipeline('docs_kb');                  -- Disabled/manual or first fill
-SELECT * FROM aidb.get_pipeline_metrics('docs_kb');
-```
-
-Choices to surface: embedding model (match chunk size to its context window), `desired_length` /
-`overlap_length`, `distance_operator` (`Cosine` for normalized embeddings, `L2` default),
-`auto_processing` (`Live` = synchronous triggers, `Background` = worker, `Disabled` = manual),
-and vector index (`aidb.vector_index_disabled_config()` above 2000 dimensions — HNSW's ceiling).
-
-Destination defaults to `pipeline_<name>`, so the KB above is `public.pipeline_docs_kb`.
-
-### B2. Retrieve
-
-```sql
-SELECT key, value, distance, part_ids
-FROM aidb.retrieve_text('public.pipeline_docs_kb', 'how do I rotate credentials?', topk => 5);
-```
-
-`value` is NULL when the source content is non-text (PDF/Image) — the other columns still fill.
-Both retrieval functions embed the query with the KB's own model via the query-side path, so you
-never pass a model name.
-
-### B3. Hybrid search (vector + full-text)
-
-Bind the user's query text to `$1`; every occurrence is the same parameter. If your client cannot
-bind parameters, substitute one properly quoted literal for each `$1`.
-
-```sql
--- $1 := the user's natural-language query (text)
-WITH vector_hits AS (
-    SELECT key, value
-    FROM aidb.retrieve_text('public.pipeline_docs_kb', $1, topk => 20)
-),
-lexical_hits AS (
-    SELECT d.id::text AS key, d.body AS value
-    FROM documents d
-    WHERE to_tsvector('english', d.body) @@ plainto_tsquery('english', $1)
-    ORDER BY ts_rank(to_tsvector('english', d.body), plainto_tsquery('english', $1)) DESC
-    LIMIT 20
-),
-candidates AS (
-    SELECT key, value FROM vector_hits
-    UNION
-    SELECT key, value FROM lexical_hits
-),
-agg AS (
-    SELECT array_agg(value ORDER BY key) AS vals FROM candidates
-)
-SELECT c.key, r.logit_score, r.text
-FROM agg a
-CROSS JOIN LATERAL aidb.rerank_text('my-reranker', $1, a.vals) AS r
-JOIN candidates c ON c.value = r.text
-ORDER BY r.logit_score DESC
-LIMIT 10;
-```
-
-No reranking model registered? Fuse with Reciprocal Rank Fusion in plain SQL instead:
-
-```sql
--- $1 := the user's natural-language query (text)
-WITH v AS (
-    SELECT key, row_number() OVER (ORDER BY distance) AS vrank
-    FROM aidb.retrieve_text('public.pipeline_docs_kb', $1, topk => 20)
-),
-l_scored AS (
-    SELECT d.id::text AS key,
-           ts_rank(to_tsvector('english', d.body), plainto_tsquery('english', $1)) AS score
-    FROM documents d
-    WHERE to_tsvector('english', d.body) @@ plainto_tsquery('english', $1)
-    ORDER BY score DESC
-    LIMIT 20
-),
-l AS (SELECT key, row_number() OVER (ORDER BY score DESC) AS lrank FROM l_scored)
-SELECT COALESCE(v.key, l.key) AS key,
-       COALESCE(1.0 / (60 + v.vrank), 0) + COALESCE(1.0 / (60 + l.lrank), 0) AS rrf_score
-FROM v FULL JOIN l ON l.key = v.key
-ORDER BY rrf_score DESC
-LIMIT 10;
-```
-
-Edge case: if `candidates` is empty, `a.vals` is NULL and `rerank_text` gets no input — guard in
-the application. To filter or join before ranking, encode with `aidb.kb_query_encode(kb, $1)::vector`
-and query the vector table directly (read its shape from `aidb.knowledge_bases`); see
-**[references/knowledge-bases.md](references/knowledge-bases.md)**.
-
-### B4. Documents, PDFs, images, object storage
-
-```sql
--- S3/GCS/Azure/local via PGFS (create the PGFS storage location first)
-SELECT aidb.create_volume('docs_vol', 'my_s3_store', 'reports/', 'Pdf');
-```
-
-```sql
--- Scanned PDFs with no text layer: render pages, OCR them, chunk, embed.
-SELECT aidb.create_pipeline(
-    name               => 'scanned_pdfs',
-    source             => 'public.pdf_docs',
-    source_key_column  => 'id',
-    source_data_column => 'content',
-    step_1             => 'PdfToImage',
-    step_1_options     => '{"dpi":300,"max_pages":20,"format":{"type":"png"}}'::jsonb,
-    step_2             => 'PerformOcr',
-    step_2_options     => aidb.ocr_config(model => 'my-ocr'),
-    step_3             => 'ChunkText',
-    step_3_options     => aidb.chunk_text_config(desired_length => 800),
-    step_4             => 'KnowledgeBase',
-    step_4_options     => aidb.knowledge_base_config(model => 'bge-m3-f16', data_format => 'Text'));
-```
-
-For digitally produced PDFs use `ParsePdf` instead — faster and needs no OCR model. All step
-operations, enums, config helpers, intermediate storage, and index helpers:
-**[references/pipelines.md](references/pipelines.md)**.
-
-## Workflow C — Semantic KB and text-to-SQL
-
-```sql
-SELECT aidb.create_semantic_kb('sales_kb', 'bge-m3-f16', ARRAY['public','sales'], 'Background');
-SELECT * FROM aidb.semantic_kb_stats('sales_kb');
-
--- Composite search: schema metadata + semantic aliases, fused with RRF (7.6.0).
-SELECT source_type, entity_type, object_ref, definition, score, rank
-FROM aidb.semantic_kb_search('which table holds invoice totals', 'sales_kb', 10);
-
--- Leanest grounding for SQL generation:
-SELECT * FROM aidb.get_column_definitions('sales_kb', 'invoice total amount');
-```
-
-Reusable parameterized query ("semantic alias") — findable by meaning, always read-only:
-
-```sql
-SELECT aidb.create_semantic_alias(
-    name        => 'top_customers',
-    description => 'Rank customers by lifetime value / total spend',
-    query_text  => 'SELECT * FROM sales.customer_ltv ORDER BY lifetime_value DESC LIMIT ${n}',
-    params      => aidb.alias_params(aidb.alias_param('n', 'integer', 'How many customers')));
-
-SELECT * FROM aidb.execute_semantic_alias('top_customers', '{"n": 10}'::jsonb);
-```
-
-`kb_name` may be omitted on most semantic-KB functions when exactly one KB exists (7.6.0).
-A well-commented schema produces a far better KB — comments are embedded alongside definitions.
-Alias functions are deliberately **not** agent tools. Details:
-**[references/knowledge-bases.md](references/knowledge-bases.md)**.
-
-## Workflow D — Tools and agents (7.6.0)
-
-### D1. Custom SQL tool
-
-```sql
-SELECT aidb.create_sql_tool(
-    name          => 'orders_for_customer',
-    description   => 'Recent orders for a customer, by email address.',
-    sql_statement => 'SELECT o.id, o.total, o.created_at FROM orders o '
-                     'JOIN customers c ON c.id = o.customer_id '
-                     'WHERE c.email = ${email} ORDER BY o.created_at DESC LIMIT ${n}',
-    params        => aidb.tool_params(
-                         aidb.tool_param('email', 'text', 'Customer email address'),
-                         aidb.tool_param('n', 'integer', 'How many orders to return')),
-    read_only     => true);
-
-SELECT aidb.run_tool('orders_for_customer', '{"email":"a@example.com","n":5}'::jsonb);
-```
-
-`${name}` values are bound as real query parameters, never interpolated. `read_only => true` is
-enforced: registration fails if the statement matches a write pattern.
-
-### D2. Import tools from an external MCP server (AIDB as MCP *client*)
-
-```sql
-SELECT aidb.import_mcp_tools(
-    name        => 'weather',
-    url         => 'https://weather.example.com/mcp',
-    transport   => 'streamable_http',
-    tool_filter => ARRAY['get_forecast'],
-    headers_env => 'AIDB_WEATHER_HEADERS');   -- JSON headers, read fresh, never stored
-
-SELECT aidb.refresh_mcp_tools('weather');     -- cache is 60 minutes
-```
-
-Only `streamable_http` works end-to-end today. Reaching the server is outbound egress, subject to
-`aidb.egress_allowlist`. `aidb.delete_tool('weather')` removes the server **and every tool it
-advertised**.
-
-### D3. Expose AIDB's whole tool catalog over MCP (AIDB as MCP *server* side)
-
-```sql
-SELECT name, description, input_schema FROM aidb.get_mcp_tools();
-```
-
-This converts **every** entry in `aidb.tools` — native, SQL, and imported MCP tools alike — into
-MCP `tools/list`-shaped descriptors, one row per tool, so an external agent platform can consume
-AIDB's catalog in MCP's own format. AIDB does not itself listen on an MCP endpoint: publish these
-descriptors from a thin external server and route each invocation back to
-`aidb.run_tool(name, arguments)`. Full catalog by category and the `aidb.tools` /
-`aidb.sql_tool_registry` / `aidb.mcp_registry` views: **[references/tools.md](references/tools.md)**.
-
-### D4. Create and converse with an agent
-
-```sql
-SELECT * FROM aidb.create_agent(
-    name            => 'support_bot',
-    instructions    => 'Answer support questions. Search the docs knowledge base before answering; '
-                       'cite the source key. Say you do not know rather than guessing.',
-    model           => 'my-gpt',
-    tools           => ARRAY['run_sql_query','semantic_kb_search','orders_for_customer'],
-    max_iterations  => 8,
-    timeout         => 120,
-    budget_strategy => 'summarize');
-
-SELECT message, conversation_id, error
-FROM aidb.agent_converse('support_bot', 'Where do I rotate my API key?');
-
--- Continue that conversation:
-SELECT message, error
-FROM aidb.agent_converse('support_bot', 'And for Azure?', conversation_id => '<uuid-from-above>');
-
--- Safe exploration: nothing is persisted, non-read-only and all MCP tools are excluded.
-SELECT message, error
-FROM aidb.agent_converse('support_bot', 'Summarise our top accounts', read_only => true);
-```
-
-`create_agent` returns `TABLE(error TEXT)` and most agent functions **return an `error` column
-instead of raising** — always select it. Model must be instruction-following: embedding,
-reranking, OCR, and multimodal-embedding providers are rejected, and `t5_local` outright.
-Prefer `openai_responses`, `anthropic_messages`, or `llamacpp_generate` (native tool calls).
-Budgets, delegation, roles, debug mode, structured output:
-**[references/agents.md](references/agents.md)**.
-
-## Workflow E — One-off AI operations, no pipeline
-
-Every step operation is a standalone function. Set-returning ones (`chunk_text`, `parse_pdf`,
-`pdf_to_image`, `perform_ocr`) must be joined **laterally** against the source table:
-
-```sql
-SELECT a.id, c.part_id, c.chunk
-FROM articles a,
-     LATERAL aidb.chunk_text(a.body, aidb.chunk_text_config(desired_length => 800)) AS c
-ORDER BY a.id, c.part_id
-LIMIT 20;
-```
-
-```sql
--- Scalar functions can be called inline.
-SELECT aidb.summarize_text(a.body,
-         aidb.summarize_text_config(model => 'qwen3.5-0.8b-Q8_0', strategy => 'reduce')) AS summary
-FROM articles a WHERE a.id = 1;
-
-SELECT aidb.generate_text('my-gpt', 'Summarise AIDB in one sentence.',
-         aidb.inference_config(temperature => 0.0, max_tokens => 200)::json) AS answer;
-
-SELECT aidb.encode_text('bge-m3-f16', 'hello world')::vector AS embedding;
-```
-
-```sql
--- One summary per group; options is REQUIRED here and must be ::json.
-SELECT topic,
-       aidb.summarize_text_aggregate(body,
-           aidb.summarize_text_config(model => 'qwen3.5-0.8b-Q8_0')::json
-           ORDER BY published_at) AS topic_summary
-FROM articles GROUP BY topic;
-```
-
-Signatures and option keys: **[references/sql-functions.md](references/sql-functions.md)**.
-
-## Workflow F — Triage a failing pipeline
-
-```sql
-SELECT * FROM aidb.get_pipeline_metrics('docs_kb');
-SELECT * FROM aidb.get_error_log_summary('docs_kb');
-SELECT id, source_id, pipeline_step, step_operation, error_category,
-       left(error_message, 200) AS error_message, retry_count, last_seen_at
-FROM aidb.get_error_logs(p_pipeline_name => 'docs_kb', p_limit => 20)
-ORDER BY last_seen_at DESC;
-```
-
-If a call errors with "function … does not exist", pass every parameter explicitly, using `NULL`
-for the filters you don't need. Then act on `error_category`:
-
-| Category | Meaning | Action |
-|---|---|---|
-| `RecordTemporary` | Transient, one record (today: model rate limits) | `SELECT * FROM aidb.requeue_pipeline_errors(p_pipeline_name => 'docs_kb');` then re-run |
-| `RecordPermanent` | Bad input for that record | Fix the source row or accept the skip |
-| `PipelineTemporary` | Network/outage; blocks the step | Retry later; check `aidb.egress_allowlist` |
-| `PipelinePermanent` | Deleted model, invalid config | Fix the cause, re-run, then `aidb.clear_error_logs('docs_kb')` |
-
-`requeue_pipeline_errors` only affects **record-level** entries; it deletes them and marks sources
-dirty — it performs no processing itself. Error-log table lives at
-`{source_schema}.pipeline_{name}_errors`.
-
----
-
-## Constraints and gotchas (state these before proposing a design)
-
-- Max **10 steps** per pipeline; name capped at **46 characters** by `create_pipeline`.
-- `KnowledgeBase` **must be the last step** — its output is a `VECTOR` no later step can consume.
-- Step sequences must be compatible; incompatible ones are rejected at creation time.
-- Models are validated at **pipeline creation** time, not execution time.
-- `aidb.update_pipeline()` only changes auto-processing settings — steps, source, and destination
-  are immutable. Recreate the pipeline to change them.
-- HNSW supports **≤2000 dimensions**; above that use `aidb.vector_index_disabled_config()`.
-- `aidb.delete_knowledge_base()` **cascades**: every attached pipeline is deleted and the vector
-  table dropped. To detach one pipeline, use `aidb.delete_pipeline()` instead.
-- Agents: hard ceiling of **25 reasoning iterations** and **10 delegation levels** regardless of
-  config; default timeout 300 s. Read-only mode always excludes MCP tools.
-- Tool names must be unique across all three tool types; **native tools cannot be deleted**.
-- **Pipeline authoring has no native agent tool** — an agent cannot build multi-step pipelines.
-- `aidb.tools` serves MCP entries from a ≤60-minute cache; a `SELECT` never makes a network call.
-
-## Reference map (load on demand)
-
-| File | Contents |
-|---|---|
-| [references/models.md](references/models.md) | Providers, `create_model`, `credentials_env`, inference functions, `inference_config`, tool calling / structured output, every config helper, default models and their context windows |
-| [references/pipelines.md](references/pipelines.md) | Pipeline types and enums, views, CRUD, all step operations + config helpers, intermediate storage, vector index helpers, the error log |
-| [references/knowledge-bases.md](references/knowledge-bases.md) | KB views, `retrieve_text`/`retrieve_key`, hybrid-search helpers, volumes, and the whole semantic KB + semantic alias surface |
-| [references/agents.md](references/agents.md) | Agent CRUD, `agent_converse`, conversations/sessions, read-only and debug modes, budgets, roles, structured output, delegation |
-| [references/tools.md](references/tools.md) | `aidb.tools`, `run_tool`, custom SQL tools, MCP import, `get_mcp_tools`, and the full native tool catalog by category |
-| [references/sql-functions.md](references/sql-functions.md) | Standalone transformations: chunk, parse HTML/PDF, PDF→image, OCR, summarize, query-side embedding |
-
-## What changed in 7.6.0 (supersedes older behavior)
-
-Agents and tools are entirely new · native tool-calling adapters `openai_responses` and
-`anthropic_messages` (+ Azure/Bedrock variants) · `credentials_env`, `create_model` now rejects
-credentials in `config`, new `aidb.audit_leaked_credentials()` · local reranking
-(`llamacpp_reranking`) and local OCR (`llamacpp_ocr`) · `decode_text` → `generate_text` ·
-`aidb.semantic_kb_search()` with RRF fusion · `kb_name` optional when a single semantic KB exists ·
-semantic aliases dropped their `model` argument and may belong to multiple KBs ·
-`last_run_completed` added to pipeline metrics.
+| `aidb.*` function/view does not exist | Extension not installed, or version drift — §2.3 / §2.4, then `pg_proc` |
+| No `aidb.%` rows in `pg_settings` | Library not preloaded: add `aidb` to `shared_preload_libraries`, restart |
+| `permission denied` on an `aidb` object | Role is not in `aidb_users` (§2.3) |
+| `Model provider with name "X" not found` | Not registered on this build — re-check `aidb.model_providers`; see the HuggingFace TEI note in models.md |
+| `config must not contain "api_key" or "basic_auth"` | Move the secret to `credentials_env` (rule §4.5) |
+| `Credentials for model provider "X" already exist` | Credentials are per provider: omit them, or `replace_credentials => true` (overwrites for all models on that provider) |
+| Pipeline stuck `Stale` | `auto_processing => 'Disabled'` — call `aidb.run_pipeline()` |
+| Pipeline `NoResults` | Empty source, or `source_data_column` points at the wrong column |
+| Pipeline `BlockingErrors` | `aidb.get_error_log_summary()` → fix cause → re-run → `aidb.clear_error_logs()`; record-level failures can be re-driven with `aidb.requeue_pipeline_errors()` |
+| `retrieve_text` returns NULL `value` | Source is binary (PDF/Image) — use `key` and join the source table yourself |
+| Retrieval returns nothing | Pipeline never ran (`aidb.pipeline_metrics`), or query/model mismatch; for semantic KBs lower `min_similarity` |
+| Agent returns a populated `error` | Model missing or not generation-capable; unknown tool name; budget/iteration/timeout exceeded — check `aidb.agent_tasks.status` |
+| Agent never calls its tools | Provider only simulates tool calls — shorten the tool list or move to `openai_responses`/`anthropic_messages`/`llamacpp_generate` |
+| Agent `conversation_id` is NULL | The run was read-only (explicitly, or automatically on a replica) |
+| Tool not found, hint mentions refresh | MCP cache expired — `aidb.refresh_mcp_tools('<server>')` |
+| MCP import fails | URL unreachable, `tool_filter` matched nothing, or the host is blocked by `aidb.egress_allowlist` |

@@ -11,6 +11,26 @@ Two distinct things share the name "knowledge base":
 | Searched with | `aidb.retrieve_text()`, `aidb.retrieve_key()` | `aidb.semantic_kb_search()` and friends |
 | Used for | RAG, semantic search over content | Schema discovery, agent tools, text-to-SQL |
 
+Always confirm which one the user means before acting.
+
+## Discovery queries — run these before advising
+
+```sql
+-- Vector KBs: name is 'schema.vector_table' and is what retrieve_* takes
+SELECT name, vector_schema, vector_table, model_name, distance_operator,
+       distance_operator_sql, pipeline_names
+FROM aidb.knowledge_bases ORDER BY name;
+
+SELECT name, pipelines, embeddings, status FROM aidb.knowledge_base_metrics ORDER BY name;
+
+-- Volumes usable as pipeline sources
+SELECT schema, volume, storage_location, path FROM aidb.volumes ORDER BY schema, volume;
+
+-- Semantic KBs and reusable parameterized queries
+SELECT * FROM aidb.list_semantic_kbs();
+SELECT name, description, param_count FROM aidb.get_semantic_aliases() ORDER BY name;
+```
+
 ## Vector knowledge bases
 
 A KB is identified by `schema.vector_table`.
@@ -50,7 +70,17 @@ Returns `key` (text), `value` (text — **NULL when the source content is non-te
 
 Only steps *before* the last one are considered, so a last-step `intermediate_destination` never appears here.
 
-Both retrieval functions embed the query with the KB's own model, using the **query-side** encoding path (`encode_text_query`), so you never pass a model name and never have to match index-time settings by hand.
+```sql
+-- Typical RAG retrieval
+SELECT key, value, distance
+FROM aidb.retrieve_text('public.pipeline_docs_rag', 'how do I rotate credentials?', topk => 5);
+
+-- Image KB: pass BYTEA, and read `key` (value is NULL for non-text sources)
+SELECT key, distance
+FROM aidb.retrieve_key('public.pipeline_images', (SELECT img FROM samples WHERE id = 1), topk => 3);
+```
+
+Distance is lower-is-closer for `L2`/`Cosine`; interpret it with the KB's `distance_operator`.
 
 ### `aidb.delete_knowledge_base`
 
@@ -60,75 +90,49 @@ To detach one pipeline from a multi-pipeline KB while keeping the rest, use `aid
 
 ## Hybrid search helpers
 
-Hybrid search combines vector similarity with Postgres full-text search. AIDB ships **helper functions** for the parts that need model or KB knowledge; the fusion itself is ordinary SQL, which is what keeps it tunable.
+Hybrid search combines vector similarity with Postgres full-text search; AIDB supplies the building blocks rather than a single hybrid function.
 
-| Helper | Signature | Purpose |
+| Function | Signature | Purpose |
 |---|---|---|
-| `aidb.kb_query_encode` | `(knowledge_base_name TEXT, query TEXT)` → `real[]` | Encode a query with the KB's **own** configured model, using the query-side encoding path. No model lookup, no mismatch risk. Cast to `::vector` to use pgvector operators |
-| `aidb.retrieve_text` | `(knowledge_base_name TEXT, query TEXT, topk INT, deduplicate BOOL)` | The vector half of a hybrid query, already joined back to source text |
-| `aidb.retrieve_key` | same parameters | The vector half when you only need keys and will join yourself |
-| `aidb.rerank_text` | `(model_name TEXT, query TEXT, input TEXT[])` → `TABLE(text, logit_score, id)` | Fuse/reorder a merged candidate set with a cross-encoder. See `models.md` |
-| `aidb.encode_text_query` | `(model_name TEXT, input TEXT)` → `real[]` | Query-side encoding when the target is *not* a registered KB (see `sql-functions.md`) |
+| `aidb.kb_query_encode` | `(knowledge_base_name TEXT, query TEXT)` → `real[]` | Encode a query with the KB's own configured model — no need to look up the model name |
+| `aidb.rerank_text` | `(model_name TEXT, query TEXT, input TEXT[])` | Post-retrieval reranking; see `models.md` |
 
-Always prefer these helpers over hand-written equivalents: they resolve the KB's model, distance operator, and query-side input type for you.
+Use `aidb.knowledge_bases.distance_operator_sql`, `vector_schema`, `vector_table`, `vector_data_column`, and `vector_key_column` to build custom queries without hardcoding paths.
 
-### Canonical hybrid pattern
-
-Vector recall via `aidb.retrieve_text()`, lexical recall via Postgres full-text search, union the candidates, then let `aidb.rerank_text()` produce the final order:
+Pattern — reciprocal rank fusion of vector and full-text results (adapt table/column names to the KB row you read from `aidb.knowledge_bases`; the `<=>` operator here assumes a `Cosine` KB):
 
 ```sql
-WITH vector_hits AS (
-    SELECT key, value
-    FROM aidb.retrieve_text('public.pipeline_docs_kb', :'q', topk => 20)
+WITH q AS (
+    SELECT aidb.kb_query_encode('public.pipeline_docs_rag', 'credential rotation')::vector AS v,
+           plainto_tsquery('english', 'credential rotation')                             AS ts
 ),
-lexical_hits AS (
-    SELECT id::text AS key, content AS value
-    FROM docs
-    WHERE to_tsvector('english', content) @@ plainto_tsquery('english', :'q')
-    ORDER BY ts_rank(to_tsvector('english', content), plainto_tsquery('english', :'q')) DESC
-    LIMIT 20
+vec AS (
+    SELECT e.source_id,
+           row_number() OVER (ORDER BY e.value <=> (SELECT v FROM q)) AS rank
+    FROM public.pipeline_docs_rag e
+    ORDER BY e.value <=> (SELECT v FROM q)
+    LIMIT 50
 ),
-candidates AS (
-    SELECT key, value FROM vector_hits
-    UNION
-    SELECT key, value FROM lexical_hits
+fts AS (
+    SELECT d.id::text AS source_id,
+           row_number() OVER (ORDER BY ts_rank_cd(to_tsvector('english', d.body),
+                                                  (SELECT ts FROM q)) DESC) AS rank
+    FROM public.documents d
+    WHERE to_tsvector('english', d.body) @@ (SELECT ts FROM q)
+    LIMIT 50
 )
-SELECT r.id, r.logit_score, c.key, r.text
-FROM (SELECT array_agg(value ORDER BY key) AS vals FROM candidates) a,
-     LATERAL aidb.rerank_text('my-reranker', :'q', a.vals) r
-JOIN candidates c ON c.value = r.text
-ORDER BY r.logit_score DESC
+SELECT COALESCE(vec.source_id, fts.source_id) AS source_id,
+       COALESCE(1.0 / (60 + vec.rank), 0) + COALESCE(1.0 / (60 + fts.rank), 0) AS score
+FROM vec FULL OUTER JOIN fts USING (source_id)
+ORDER BY score DESC
 LIMIT 10;
 ```
 
-`rerank_text`'s `id` is the index into the input array, so either join on the text (as above) or keep a materialized ordered array and index into it.
-
-If no reranking model is registered, fuse with Reciprocal Rank Fusion in SQL instead: rank each side with `row_number()` and sum `1.0 / (60 + rank)` per key. (`aidb.semantic_kb_search()` uses the same RRF idea over *schema* search — it is not applicable to vector KBs.)
-
-### Customization path: querying the vector table directly
-
-When you need something the helpers do not express — a filtered pre-selection, a window function, a join against business columns before ranking — encode with `aidb.kb_query_encode()` and query the KB's vector table yourself. Read `vector_schema`, `vector_table`, `vector_data_column`, `vector_key_column`, and `distance_operator_sql` from `aidb.knowledge_bases` rather than hardcoding them, so the query survives a KB reconfiguration:
-
-```sql
-SELECT vector_schema, vector_table, vector_data_column, vector_key_column, distance_operator_sql
-FROM aidb.knowledge_bases WHERE name = 'public.pipeline_docs_kb';
-```
-
-```sql
--- distance operator below must match distance_operator_sql for this KB
-SELECT v.source_id, v.value <=> aidb.kb_query_encode('public.pipeline_docs_kb', $1)::vector AS distance
-FROM public.pipeline_docs_kb v
-JOIN docs d ON d.id::text = v.source_id
-WHERE d.tenant_id = $2
-ORDER BY distance
-LIMIT 10;
-```
-
-This path is a customization, not the default: it bypasses `retrieve_text`'s deduplication of multi-chunk sources and its source-text join, both of which you then own.
+Then optionally rerank the shortlist with `aidb.rerank_text()` using a reranking model that exists on this installation.
 
 ## Volumes
 
-A volume exposes a PGFS storage location as a foreign table usable as a pipeline source. Set up the PGFS storage location first.
+A volume exposes a PGFS storage location as a foreign table usable as a pipeline source. Set up the PGFS storage location first (`pgfs.create_storage_location(...)` — a separate extension).
 
 | Function / view | Signature | Notes |
 |---|---|---|
@@ -137,6 +141,8 @@ A volume exposes a PGFS storage location as a foreign table usable as a pipeline
 | `aidb.delete_volume` | `(volume_name TEXT)` | Deleting the underlying PGFS storage location deletes all volumes built on it |
 
 `path` is canonicalized to a single trailing slash — `foo`, `/foo`, `foo/`, `/foo/` all store as `foo/`; `NULL` or `/` store as `/`.
+
+Outbound access to object storage and to model endpoints is subject to the `aidb.egress_allowlist` GUC.
 
 ## Semantic knowledge bases
 
@@ -174,8 +180,6 @@ A semantic KB uses a **single embedding model** for all its metadata and for any
 | `min_similarity` | double precision | NULL | Similarity floor |
 
 Returns `source_type` (`schema` or `alias`), `entity_type`, `schema_name`, `relation_name`, `column_name` (empty for table/view matches), `object_ref`, `definition`, `comment`, `score` (fused RRF), `rank` (1-based), `components` (jsonb — per-source scores).
-
-`top_k < 1` and an unrecognized `sources` value are both rejected with an error.
 
 Four narrower functions search schema metadata only. All share `kb_name`, `query_text`, `min_similarity`, `top_k`, `offset`, and return a cosine `similarity` (higher is closer).
 
@@ -222,3 +226,35 @@ These are distinct from `aidb.tool_param()`/`aidb.tool_params()`, which build pa
 `update_semantic_alias` reconciles embeddings: changing `query_text` or `kb_name` re-infers owning KBs, adding and dropping embeddings; changing `description` re-embeds in every KB it already belongs to. Deleting a KB removes only that KB's embedding — the alias and its other embeddings survive, and a later KB covering the same schema adopts it.
 
 **Alias functions are deliberately not exposed as agent tools.** An agent can discover and read schema, but cannot create or execute aliases itself.
+
+```sql
+-- Create a semantic KB over two schemas, then find the right table by meaning
+SELECT aidb.create_semantic_kb(
+    name  => 'app_schema_kb',
+    model => 'bge-m3-f16',
+    schemas => ARRAY['public', 'sales']);
+
+SELECT relation_name, column_name, entity_type, score
+FROM aidb.semantic_kb_search('where are customer email addresses stored?', top_k => 5);
+
+-- A reusable parameterized query, findable by description
+SELECT aidb.create_semantic_alias(
+    name        => 'orders_by_status',
+    description => 'List orders filtered by their current status',
+    query_text  => 'SELECT id, total FROM sales.orders WHERE status = ${status}',
+    params      => aidb.alias_params(
+                       aidb.alias_param('status', 'text', 'Order status',
+                                        ARRAY['open','shipped','cancelled'])));
+
+SELECT * FROM aidb.execute_semantic_alias('orders_by_status', '{"status": "open"}'::jsonb);
+```
+
+## Common errors
+
+| Symptom | Cause / fix |
+|---|---|
+| `retrieve_text` returns rows with NULL `value` | Source content is binary (PDF/Image) — use `key` and join the source yourself |
+| `topk` error | Must be positive |
+| Empty results | Pipeline never ran (`aidb.pipeline_metrics`), or the query language/model mismatches the KB's model |
+| Ambiguity error from a semantic KB function | More than one semantic KB exists — pass `kb_name` explicitly |
+| Deleting a KB removed pipelines too | `delete_knowledge_base` cascades by design; use `delete_pipeline` to detach one pipeline |

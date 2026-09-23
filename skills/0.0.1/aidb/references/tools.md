@@ -12,6 +12,22 @@ A tool is anything an agent can invoke by name. Three kinds, one catalog:
 
 Grant an agent a tool by listing its name in `create_agent`/`update_agent`'s `tools` array. Tools can also be invoked directly from SQL (testing, development), and AIDB's whole catalog can be exposed over MCP to external agents.
 
+## Discovery queries — run these before advising
+
+```sql
+-- The catalog this installation actually has
+SELECT name, tool_type, read_only, description FROM aidb.tools ORDER BY tool_type, name;
+
+-- Exact parameters of one tool (never guess these)
+SELECT params FROM aidb.tools WHERE name = 'run_sql_query';
+
+-- Stored query text of a custom SQL tool
+SELECT name, query_text, read_only FROM aidb.sql_tool_registry ORDER BY name;
+
+-- Registered MCP servers (headers columns are not readable by aidb_users)
+SELECT name, url, transport, tool_filter FROM aidb.mcp_registry ORDER BY name;
+```
+
 ## Catalog views
 
 ### `aidb.tools`
@@ -46,6 +62,13 @@ Query this directly to see a SQL tool's stored query text; use `aidb.tools` for 
 
 Arguments are validated against the tool's declared parameters. If a tool isn't found, the error suggests `aidb.refresh_mcp_tools()` in case an MCP cache expired.
 
+```sql
+SELECT aidb.run_tool('catalog_list_objects',
+                     '{"schema": "public", "object_type": "table"}'::jsonb);
+```
+
+Use `run_tool` to test a tool before granting it to an agent.
+
 ## Custom SQL tools
 
 ### `aidb.create_sql_tool`
@@ -66,6 +89,21 @@ Returns `TEXT` — the tool's name. **Raises** if the name is taken by any tool 
 **Read-only enforcement works in both directions.** Left at the default `true`, registration fails immediately if `sql_statement` matches a recognized write pattern (`INSERT`, `UPDATE`, `DELETE`, …), so a mislabeled tool can't get through. A tool explicitly marked `read_only => false` is excluded from read-only agent runs, the same as an unclassified native or MCP tool. At invocation a read-only SQL tool runs under `SET LOCAL transaction_read_only = on`, scoped to the invocation by a discarded subtransaction, so the caller's transaction can still write afterwards.
 
 `sql_statement` must be a single statement and cannot be a utility statement such as `EXPLAIN` or `COPY`. Trailing whitespace and a trailing `;` are stripped at registration.
+
+```sql
+SELECT aidb.create_sql_tool(
+    name          => 'orders_for_customer',
+    description   => 'Return recent orders for a customer id, newest first.',
+    sql_statement => 'SELECT id, total, created_at FROM sales.orders
+                      WHERE customer_id = ${customer_id}
+                      ORDER BY created_at DESC LIMIT ${limit}',
+    params        => aidb.tool_params(
+                         aidb.tool_param('customer_id', 'integer', 'Customer id'),
+                         aidb.tool_param('limit', 'integer', 'Maximum rows to return')),
+    read_only     => true);
+
+SELECT aidb.run_tool('orders_for_customer', '{"customer_id": 42, "limit": 5}'::jsonb);
+```
 
 ### `aidb.delete_tool`
 
@@ -98,7 +136,7 @@ The server is validated via its `tools/list` endpoint before anything is stored,
 
 - Only `streamable_http` works end-to-end today; `sse` is accepted but not fully implemented.
 - Reaching an MCP server is an outbound network call, subject to the `aidb.egress_allowlist` GUC like model calls and HuggingFace downloads.
-- `headers_env` must start with the `aidb.env_var_allowed_prefix` prefix (`AIDB_` by default) — the same mechanism as `credentials_env` for model credentials.
+- `headers_env` must start with the `aidb.env_var_allowed_prefix` prefix (`AIDB_` by default) — the same mechanism as `credentials_env` for model credentials. Prefer it over `headers` so tokens are never persisted.
 
 ### `aidb.refresh_mcp_tools`
 
@@ -178,4 +216,15 @@ Letting an agent create or reconfigure *other* agents (including itself) is a se
 
 `search_pipelines` (Y), `get_pipeline` (Y), `delete_pipeline` (N), `run_pipeline` (N), `get_pipeline_metrics` (Y), `get_error_logs` (Y), `clear_error_logs` (N), `requeue_pipeline_errors` (N), `get_error_log_summary` (Y), `get_all_error_summaries` (Y).
 
-**Pipeline authoring has no native tool.** `aidb.create_pipeline`/`update_pipeline` take up to 30 parameters across step/step-options pairs — impractical for one generic tool call — so an agent cannot author multi-step pipelines on its own.
+**Pipeline authoring has no native tool.** `aidb.create_pipeline`/`update_pipeline` take up to 30 parameters across step/step-options pairs — impractical for one generic tool call — so an agent cannot author multi-step pipelines on its own. Author pipelines from SQL, with the user's confirmation.
+
+## Common errors
+
+| Symptom | Cause / fix |
+|---|---|
+| Tool not found (with a `refresh_mcp_tools` hint) | MCP cache expired or the server was never imported |
+| `create_sql_tool` raises on the name | Names are unique across native, SQL, and MCP tools |
+| `create_sql_tool` raises on the statement | Not a single invocable statement, a utility statement, or a write with `read_only => true` |
+| Agent can't see a tool in read-only mode | The tool is `read_only => false`, unclassified, or an MCP tool (always excluded) |
+| `delete_tool` raises | Native tools cannot be deleted |
+| Import fails | URL unreachable, `tool_filter` matched nothing, or the host is blocked by `aidb.egress_allowlist` |
