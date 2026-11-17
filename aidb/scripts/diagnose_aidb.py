@@ -3,17 +3,22 @@
 AIDB diagnostic helper.
 
 Usage:
-    python3 diagnose_aidb.py [--host HOST] [--port PORT] [--dbname DB] [--user USER]
+    python3 diagnose_aidb.py [--host HOST] [--port PORT] [--dbname DB] [--user USER] [--password PW]
 
 Connects to a running PostgreSQL instance with AIDB installed and prints:
   - Extension installation status
   - Registered models
-  - Pipeline list and their auto-processing modes
+  - Pipelines and their auto-processing modes
   - Semantic KB list
-  - Agent list
-  - MCP registry
+  - Agents, SQL tools, MCP servers, purposes
   - Key GUC values
-  - Recent pipeline errors (last 10 per pipeline)
+  - Pipeline error counts per pipeline and step
+
+Run it as a superuser or a member of aidb_users. A role that cannot read a
+section, or a pipeline's error table, gets "permission denied", which is
+reported as an issue rather than as zero errors.
+
+Exit codes: 0 no issues found, 1 issues found, 2 cannot connect or aidb not installed.
 
 Requires: psycopg2 (pip install psycopg2-binary)
 """
@@ -26,23 +31,29 @@ try:
     import psycopg2.extras
 except ImportError:
     print("ERROR: psycopg2 is required. Install it with: pip install psycopg2-binary", file=sys.stderr)
-    sys.exit(1)
+    sys.exit(2)
+
+EXIT_OK = 0
+EXIT_ISSUES = 1
+EXIT_UNAVAILABLE = 2
 
 
 def connect(args):
     try:
-        conn = psycopg2.connect(
-            host=args.host,
-            port=args.port,
-            dbname=args.dbname,
-            user=args.user,
-            password=args.password,
-        )
+        # Unset options fall back to libpq defaults (PGHOST, PGPORT, PGUSER, PGDATABASE, ...)
+        params = {
+            "host": args.host,
+            "port": args.port,
+            "dbname": args.dbname,
+            "user": args.user,
+            "password": args.password,
+        }
+        conn = psycopg2.connect(**{k: v for k, v in params.items() if v is not None})
         conn.autocommit = True
         return conn
     except Exception as e:
         print(f"ERROR: Could not connect to PostgreSQL: {e}", file=sys.stderr)
-        sys.exit(1)
+        sys.exit(EXIT_UNAVAILABLE)
 
 
 def query(conn, sql, params=None):
@@ -51,7 +62,11 @@ def query(conn, sql, params=None):
             cur.execute(sql, params)
             return cur.fetchall()
         except Exception as e:
-            return [{"error": str(e)}]
+            return [{"error": str(e).strip()}]
+
+
+def failed(rows):
+    return bool(rows) and "error" in rows[0]
 
 
 def section(title):
@@ -61,128 +76,151 @@ def section(title):
 
 
 def print_rows(rows, empty_msg="(none)"):
+    """Print rows; return True when the query failed"""
     if not rows:
         print(f"  {empty_msg}")
-        return
+        return False
+    if failed(rows):
+        print(f"  ERROR: {rows[0]['error']}")
+        return True
     for row in rows:
-        if "error" in row:
-            print(f"  ERROR: {row['error']}")
-            return
-        parts = []
-        for k, v in row.items():
-            parts.append(f"{k}={v!r}")
-        print("  " + " | ".join(parts))
+        print("  " + " | ".join(f"{k}={v!r}" for k, v in row.items()))
+    return False
+
+
+def print_gucs(conn, gucs):
+    """Print GUC values; return True when a lookup failed"""
+    issue = False
+    for guc in gucs:
+        rows = query(conn, "SELECT current_setting(%s, true) AS value", (guc,))
+        if failed(rows):
+            print(f"  {guc}: ERROR: {rows[0]['error']}")
+            issue = True
+            continue
+        val = rows[0]["value"] if rows else None
+        print(f"  {guc} = {'(not set)' if val is None else repr(val)}")
+    return issue
 
 
 def main():
-    parser = argparse.ArgumentParser(description="AIDB diagnostic helper")
-    parser.add_argument("--host", default="localhost")
-    parser.add_argument("--port", type=int, default=5432)
-    parser.add_argument("--dbname", default="postgres")
-    parser.add_argument("--user", default="postgres")
-    parser.add_argument("--password", default="")
+    parser = argparse.ArgumentParser(
+        description="AIDB diagnostic helper",
+        epilog="Exit codes: 0 no issues found, 1 issues found, 2 cannot connect or aidb not installed.",
+    )
+    parser.add_argument("--host", help="default: PGHOST or libpq default")
+    parser.add_argument("--port", type=int, help="default: PGPORT or 5432")
+    parser.add_argument("--dbname", help="default: PGDATABASE or the user name")
+    parser.add_argument("--user", help="default: PGUSER or the OS user")
+    parser.add_argument("--password", help="default: PGPASSWORD or ~/.pgpass")
     args = parser.parse_args()
 
     conn = connect(args)
-    print(f"Connected to {args.host}:{args.port}/{args.dbname} as {args.user}")
+    dsn = conn.get_dsn_parameters()
+    args.dbname = dsn.get("dbname")
+    print(f"Connected to {dsn.get('host')}:{dsn.get('port')}/{args.dbname} as {dsn.get('user')}")
+    issues = []
 
-    # 1. Extension check
+    # 1. Extension check, before any aidb query
     section("AIDB Extension Status")
-    rows = query(conn, "SELECT name, default_version, installed_version FROM pg_available_extensions WHERE name = 'aidb'")
-    print_rows(rows, "AIDB extension not found in pg_available_extensions")
+    rows = query(
+        conn,
+        "SELECT e.extversion AS installed_version, a.default_version "
+        "FROM pg_extension e LEFT JOIN pg_available_extensions a ON a.name = e.extname "
+        "WHERE e.extname = 'aidb'",
+    )
+    if failed(rows):
+        print(f"  ERROR: {rows[0]['error']}")
+        conn.close()
+        sys.exit(EXIT_UNAVAILABLE)
+    if not rows:
+        print(f"aidb extension is not installed in database {args.dbname}")
+        conn.close()
+        sys.exit(EXIT_UNAVAILABLE)
+    print_rows(rows)
 
-    # 2. Models
-    section("Registered Models")
-    rows = query(conn, "SELECT name, provider FROM aidb.list_models()")
-    print_rows(rows, "No models registered")
+    checks = [
+        ("Registered Models", "SELECT name, provider FROM aidb.list_models() ORDER BY name", "No models registered"),
+        ("Pipelines", "SELECT name, id, source_schema, auto_processing FROM aidb.pipelines ORDER BY name", "No pipelines defined"),
+        ("Semantic Knowledge Bases", "SELECT name, model_name, schemas, auto_processing FROM aidb.list_semantic_kbs()", "No semantic KBs defined"),
+        ("Agents", "SELECT name, model, purpose FROM aidb.agents ORDER BY name", "No agents defined"),
+        ("SQL Tools", "SELECT name, description, read_only FROM aidb.sql_tool_registry ORDER BY name", "No SQL tools registered"),
+        ("MCP Servers", "SELECT name, url, transport FROM aidb.mcp_registry ORDER BY name", "No MCP servers registered"),
+        ("Purpose Registry", "SELECT name, role, deleted_at FROM aidb.purpose_registry ORDER BY name", "No purposes defined"),
+    ]
+    for title, sql, empty_msg in checks:
+        section(title)
+        if print_rows(query(conn, sql), empty_msg):
+            issues.append(title)
 
-    # 3. Pipelines
-    section("Pipelines")
-    rows = query(conn, "SELECT name, id, auto_processing FROM aidb.list_pipelines()")
-    print_rows(rows, "No pipelines defined")
-
-    # 4. Semantic KBs
-    section("Semantic Knowledge Bases")
-    rows = query(conn, "SELECT name, model, auto_processing FROM aidb.list_semantic_kbs()")
-    print_rows(rows, "No semantic KBs defined")
-
-    # 5. Agents
-    section("Agents")
-    rows = query(conn, "SELECT name, model, purpose FROM aidb.agents")
-    print_rows(rows, "No agents defined")
-
-    # 6. SQL Tools
-    section("SQL Tools")
-    rows = query(conn, "SELECT name, description, read_only FROM aidb.sql_tool_registry")
-    print_rows(rows, "No SQL tools registered")
-
-    # 7. MCP Registry
-    section("MCP Servers")
-    rows = query(conn, "SELECT name, url, transport FROM aidb.mcp_registry")
-    print_rows(rows, "No MCP servers registered")
-
-    # 8. Purpose Registry
-    section("Purpose Registry")
-    rows = query(conn, "SELECT name, role, deleted_at FROM aidb.purpose_registry")
-    print_rows(rows, "No purposes defined")
-
-    # 9. Key GUCs
     section("Key GUC Values")
-    gucs = [
+    if print_gucs(conn, [
         "aidb.max_threads",
         "aidb.pipeline_error_warnings",
-        "aidb.enable_memory_worker",
+        "aidb.agent_memory_enable_worker",
+        "aidb.memory_worker_idle_wait_ms",
         "aidb.agent_session_source",
         "aidb.agent_memory_namespace",
         "aidb.otel_client",
         "aidb.egress_allowlist",
         "aidb.allow_insecure_egress",
         "aidb.allow_insecure_tls",
-    ]
-    for guc in gucs:
-        rows = query(conn, "SELECT current_setting(%s, true) AS value", (guc,))
-        val = rows[0].get("value", "N/A") if rows else "N/A"
-        print(f"  {guc} = {val!r}")
+    ]):
+        issues.append("Key GUC Values")
 
-    # 10. MCP endpoint GUCs
-    section("MCP Endpoint GUCs")
-    mcp_gucs = [
+    # Endpoint GUCs exist only when the endpoints library is loaded
+    section("Endpoint GUCs")
+    if print_gucs(conn, [
+        "edb.endpoints_enabled",
+        "edb.endpoints_host",
         "edb.endpoints_mcp_enabled",
         "edb.endpoints_mcp_host",
         "edb.endpoints_mcp_port",
-    ]
-    for guc in mcp_gucs:
-        rows = query(conn, "SELECT current_setting(%s, true) AS value", (guc,))
-        val = rows[0].get("value", "N/A") if rows else "N/A"
-        print(f"  {guc} = {val!r}")
+    ]):
+        issues.append("Endpoint GUCs")
 
-    # 11. Recent pipeline errors
-    section("Recent Pipeline Errors (last 5 per pipeline)")
-    pipeline_rows = query(conn, "SELECT name, id FROM aidb.list_pipelines()")
-    if pipeline_rows and "error" not in pipeline_rows[0]:
-        for p in pipeline_rows:
-            pid = p.get("id")
-            pname = p.get("name")
-            if pid is None:
-                continue
-            err_table = f"aidb_internal.pipeline_error_log_{pid}"
-            err_rows = query(
-                conn,
-                f"SELECT occurred_at, step_number, error_message FROM {err_table} ORDER BY occurred_at DESC LIMIT 5"
-            )
-            if err_rows and "error" not in err_rows[0]:
-                print(f"\n  Pipeline '{pname}' (id={pid}) errors:")
-                for er in err_rows:
-                    print(f"    [{er.get('occurred_at')}] step={er.get('step_number')}: {er.get('error_message')}")
-            elif err_rows and "error" in err_rows[0]:
-                print(f"  Pipeline '{pname}': could not read error log — {err_rows[0]['error']}")
-            else:
-                print(f"  Pipeline '{pname}': no errors recorded")
+    section("Pipeline Errors")
+    pipelines = query(conn, "SELECT name FROM aidb.pipelines ORDER BY name")
+    if failed(pipelines):
+        print(f"  ERROR: {pipelines[0]['error']}")
+        issues.append("Pipeline Errors")
+    elif not pipelines:
+        print("  No pipelines defined")
     else:
-        print("  No pipelines to check.")
+        any_errors = False
+        for p in pipelines:
+            name = p["name"]
+            # Per pipeline, since get_all_error_summaries() silently skips error tables the role cannot read
+            detail = query(
+                conn,
+                "SELECT pipeline_step, step_operation, error_category, error_count, latest_failed_at "
+                "FROM aidb.get_error_log_summary(%s)",
+                (name,),
+            )
+            if failed(detail):
+                print(f"  {name}: cannot read error log: {detail[0]['error'].splitlines()[0]}")
+                issues.append(f"pipeline {name}")
+                continue
+            count = sum(d["error_count"] for d in detail)
+            print(f"  {name}: {count} error{'' if count == 1 else 's'}")
+            if not count:
+                continue
+            any_errors = True
+            issues.append(f"pipeline {name}")
+            for d in detail:
+                print(
+                    f"    step {d['pipeline_step']} {d['step_operation']} ({d['error_category']}): "
+                    f"{d['error_count']}, latest {d['latest_failed_at']}"
+                )
+        if any_errors:
+            print("  Inspect rows with: SELECT * FROM aidb.get_error_logs('<pipeline>', p_limit => 10);")
 
     conn.close()
-    print("\nDone.")
+    print()
+    if issues:
+        print(f"Issues found in: {', '.join(issues)}")
+        sys.exit(EXIT_ISSUES)
+    print("All checks passed. No issues found.")
+    sys.exit(EXIT_OK)
 
 
 if __name__ == "__main__":

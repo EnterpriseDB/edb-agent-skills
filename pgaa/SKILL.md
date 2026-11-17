@@ -1,441 +1,424 @@
 ---
 name: pgaa
 description: >
-  Skill for operating EDB Postgres Analytics Accelerator (pgaa) — a PostgreSQL
-  extension that registers a custom Table Access Method (TAM) to offload reads
-  and writes to an external analytical engine, enabling direct querying of
-  Apache Iceberg, Delta Lake, and Parquet tables from PostgreSQL. Trigger this
-  skill whenever a user needs to install, configure, create, query, maintain,
-  monitor, or troubleshoot pgaa tables or catalogs; manage pgfs storage
-  locations; set up PGD-to-Iceberg replication; configure tiered tables; run
-  background maintenance tasks (compaction, vacuum, zorder, purge); diagnose
-  scan-mode or performance issues; or work with pgaa in any of its three
-  deployment contexts: standalone Lakehouse Cluster, WarehousePG (WHPG)
-  distributed MPP, or PGD (HTAP) cluster.
+  Skill for the EDB Postgres Analytics Accelerator (pgaa) — a PostgreSQL
+  extension that registers a Table Access Method (TAM) allowing PostgreSQL to
+  read and write Apache Iceberg, Delta Lake, and Parquet tables stored in object
+  storage. Use this skill whenever a user needs to: install or configure pgaa;
+  create analytics tables (catalog-managed or via direct storage location);
+  register and manage Iceberg catalogs; query lakehouse data from PostgreSQL;
+  set up PGD-to-Iceberg replication or tiered tables; schedule background
+  maintenance tasks (compaction, vacuum, zorder, purge); smoke-test a pgaa
+  deployment; or troubleshoot pgaa query routing, catalog sync, or replication
+  issues. Aliases: beacon-analytics, postgres-analytics-accelerator,
+  analytics-accelerator.
 metadata:
   aliases:
     - pgaa
     - beacon-analytics
     - postgres-analytics-accelerator
     - analytics-accelerator
-  requires:
-    - PostgreSQL 16, 17, or 18
-    - pgfs extension (auto-installed via CASCADE)
-  deployment_contexts:
-    - Lakehouse Cluster (standalone)
-    - WarehousePG (WHPG) — distributed MPP
-    - PGD Cluster — HTAP transactional+analytics
+  postgresql_versions: ["16", "17", "18"]
+  formats: ["iceberg", "delta", "parquet"]
+  engines: ["seafowl", "spark_connect"]
+  deployment_contexts: ["lakehouse-cluster", "warehousepg", "pgd"]
 ---
 
 # pgaa — EDB Postgres Analytics Accelerator
 
-`pgaa` is a PostgreSQL extension that implements a **Table Access Method (TAM)**,
-routing reads and writes for designated tables to an external analytical engine
-rather than Postgres heap storage. It enables querying Apache Iceberg, Delta
-Lake, and Parquet data directly from SQL. It requires PostgreSQL 16–18 and
-depends on `pgfs` (auto-installed).
+pgaa is a PostgreSQL extension that registers a custom **Table Access Method (TAM)**
+so that reads and writes against designated tables are offloaded to an external
+analytical engine rather than executed against Postgres heap storage. It lets
+PostgreSQL query Apache Iceberg, Delta Lake, and Parquet tables in object storage
+directly using standard SQL.
+
+**Requires:** PostgreSQL 16–18 and the `pgfs` extension (auto-installed via CASCADE).
 
 ---
 
-## 1. Installation
+## Deployment Contexts
+
+| Context | Description | Key Requirement |
+|---|---|---|
+| **Lakehouse Cluster** | Standalone EDB Postgres for direct analytics queries | None beyond `CREATE EXTENSION pgaa CASCADE` |
+| **WarehousePG (WHPG)** | pgaa inside a Greenplum-fork MPP cluster | `pgaa` in `shared_preload_libraries` before server start; DirectScan falls back to CompatScan |
+| **PGD** | HTAP — transactional tables replicate from PGD heap to Iceberg | `bdr` extension; configure a default write catalog |
+
+---
+
+## Step 1 — Install the Extension
 
 ```sql
--- Auto-installs the required pgfs dependency
-CREATE EXTENSION pgaa CASCADE;
+CREATE EXTENSION pgaa CASCADE;   -- also installs pgfs
 ```
 
-**WarehousePG (WHPG) only:** `pgaa` must also appear in `postgresql.conf` on
-the coordinator *and every segment host* before the cluster starts:
-
+**WarehousePG only** — add to `postgresql.conf` before the first start:
 ```
 shared_preload_libraries = 'pgaa'
 ```
 
-Restart the cluster after editing this file.
-
 ---
 
-## 2. Verify the Installation (Smoke Test)
+## Step 2 — Set Up Storage Access
 
-Use the public TPC-H SF1 sample bucket (no credentials needed):
+pgaa tables are backed by either an **Iceberg catalog** (recommended) or a
+**pgfs storage location** (direct, catalog-free access to Delta/Parquet).
+
+### Register an Iceberg REST Catalog
 
 ```sql
-CREATE SCHEMA IF NOT EXISTS smoke_test;
-
-SELECT pgfs.create_storage_location(
-    'smoke-test-data',
-    's3://beacon-analytics-demo-data-us-east-1-prod',
-    '{"aws_skip_signature": "true"}'
+-- Bearer-token auth (e.g., Lakekeeper)
+SELECT pgaa.add_catalog(
+  'my_catalog',
+  'iceberg-rest',
+  '{"url": "<CATALOG_URL>", "warehouse": "<WAREHOUSE_ID>", "token": "<TOKEN>"}'::json
 );
 
--- Empty column list () → pgaa auto-discovers schema
-CREATE TABLE smoke_test.customer () USING PGAA WITH (
-    pgaa.storage_location = 'smoke-test-data',
-    pgaa.path             = 'tpch_sf_1/customer'
+-- OAuth2 client credentials
+SELECT pgaa.add_catalog(
+  'my_catalog',
+  'iceberg-rest',
+  '{"url": "<CATALOG_URL>", "oauth2.grant_type": "client_credentials",
+    "oauth2.client_id": "<ID>", "oauth2.client_secret": "<SECRET>",
+    "oauth2.token_uri": "<TOKEN_URI>"}'::json
 );
 
-SELECT COUNT(*) FROM smoke_test.customer;  -- expected: 150000
+-- AWS S3 Tables catalog
+SELECT pgaa.add_catalog(
+  'my_s3tables',
+  'iceberg-s3tables',
+  '{"arn": "arn:aws:s3tables:<REGION>:<ACCOUNT>:bucket/<BUCKET>", "region": "<REGION>"}'::json
+);
 
--- Confirm query offload
-EXPLAIN SELECT COUNT(*) FROM smoke_test.customer;
--- Lakehouse/PGD: "SeafowlDirectScan"
--- WarehousePG:   "SeafowlCompatScan" (expected — Greenplum intercepts)
-
--- Cleanup (table before storage location)
-DROP TABLE smoke_test.customer CASCADE;
-DROP SCHEMA smoke_test CASCADE;
-SELECT pgfs.delete_storage_location('smoke-test-data');
+-- Validate before registering (returns NULL on success)
+SELECT pgaa.validate_catalog_connection('iceberg-rest', '{"url": "...", "token": "..."}'::json);
 ```
 
-Run `scripts/pgaa_smoke_test.py` for an automated version of this test.
+> **S3 Tables limitation:** `iceberg-s3tables` catalogs do **not** support PGD
+> features (replication, tiered tables, partition offload). Use `iceberg-rest` for
+> any PGD-integrated workflow.
+
+### Create a pgfs Storage Location (for Delta/Parquet or smoke tests)
+
+```sql
+SELECT pgfs.create_storage_location(
+  'my_location',
+  's3://<BUCKET>/<PREFIX>/',
+  '{"region": "<REGION>"}'::json,
+  '{"access_key_id": "<KEY>", "secret_access_key": "<SECRET>"}'::json
+);
+
+-- Public/anonymous bucket (no credentials needed):
+SELECT pgfs.create_storage_location(
+  'public_data',
+  's3://public-bucket/',
+  '{"aws_skip_signature": "true"}'::json
+);
+```
+
+For full pgfs documentation: [references/pgfs-reference.md](references/pgfs-reference.md)
 
 ---
 
-## 3. Creating pgaa Tables
+## Step 3 — Create pgaa Tables
 
-Two patterns exist. Choose based on your data format and infrastructure.
-
-### Pattern 1 — Catalog-Managed (Recommended for Iceberg)
-
-Register a catalog once, then point tables at it. Schema is auto-discovered
-from the catalog when the column list is empty.
+### Pattern 1: Catalog-Managed (recommended for Iceberg)
 
 ```sql
--- Step 1: Register an Iceberg REST catalog
-SELECT pgaa.add_catalog(
-    'my_catalog',
-    'iceberg-rest',
-    '{
-        "url":       "https://your-catalog-host/catalog",
-        "warehouse": "your-warehouse-uuid",
-        "token":     "your-bearer-token"
-    }'
-);
+CREATE SCHEMA IF NOT EXISTS analytics;
 
--- Step 2: Create table (empty columns = auto-discover schema)
+-- Empty column list = auto-discover schema from the catalog table
 CREATE TABLE analytics.events () USING PGAA WITH (
-    pgaa.managed_by        = 'my_catalog',
-    pgaa.catalog_namespace = 'production',
-    pgaa.catalog_table     = 'events',
-    pgaa.format            = 'iceberg'
+  pgaa.managed_by        = 'my_catalog',
+  pgaa.catalog_namespace = 'production',
+  pgaa.catalog_table     = 'events',
+  pgaa.format            = 'iceberg'
 );
+```
 
--- Query normally
+### Pattern 2: Direct Storage Location (for Delta/Parquet)
+
+```sql
+CREATE TABLE analytics.logs () USING PGAA WITH (
+  pgaa.storage_location = 'my_location',
+  pgaa.path             = 'logs/2024/',
+  pgaa.format           = 'delta'    -- 'delta' | 'parquet' (parquet is read-only)
+);
+```
+
+### Pattern 3: CTAS — Write Query Results to Lakehouse
+
+```sql
+CREATE TABLE analytics.summary USING PGAA WITH (
+  pgaa.managed_by           = 'my_catalog',
+  pgaa.catalog_namespace    = 'production',
+  pgaa.catalog_table        = 'summary',
+  pgaa.format               = 'iceberg',
+  pgaa.purge_data_if_exists = true      -- required if data exists at the target
+) AS SELECT region, SUM(amount) FROM orders GROUP BY region;
+```
+> CTAS source queries always use CompatScan (not DirectScan). Fails if data exists
+> at the target path unless `pgaa.purge_data_if_exists = true`.
+
+### Pattern 4: Convert an Existing Heap Table In Place
+
+```sql
+-- Heap → pgaa (catalog-managed)
+ALTER TABLE public.my_table
+  SET ACCESS METHOD pgaa,
+  SET (pgaa.auto_truncate = 'true', pgaa.format = 'iceberg',
+       pgaa.managed_by = 'my_catalog', pgaa.catalog_namespace = 'ns',
+       pgaa.catalog_table = 'my_table');
+
+-- pgaa → heap (revert)
+ALTER TABLE public.my_table SET ACCESS METHOD heap;
+```
+
+For complete paste-ready SQL templates: [assets/sql-templates.md](assets/sql-templates.md)
+
+---
+
+## Querying pgaa Tables
+
+```sql
+-- Standard SQL — pgaa routes to the analytics engine transparently
 SELECT event_type, COUNT(*)
 FROM analytics.events
 WHERE event_date >= CURRENT_DATE - INTERVAL '7 days'
 GROUP BY event_type;
-```
 
-See [assets/quick-reference.md](assets/quick-reference.md) for full catalog
-option JSON schemas (REST and S3 Tables).
-
-### Pattern 2 — Direct Storage Location (Delta / Parquet / Quick Tests)
-
-```sql
--- Step 1: Create a pgfs storage location
-SELECT pgfs.create_storage_location(
-    'my-delta-store',
-    's3://my-analytics-bucket/data/',
-    NULL,
-    '{"access_key_id": "AKIA...", "secret_access_key": "..."}'
-);
-
--- Step 2: Create pgaa table
-CREATE TABLE analytics.orders () USING PGAA WITH (
-    pgaa.storage_location = 'my-delta-store',
-    pgaa.path             = 'orders/',
-    pgaa.format           = 'delta'       -- or 'parquet' (read-only)
-);
-```
-
-See [references/pgfs-guide.md](references/pgfs-guide.md) for full pgfs
-storage location management.
-
-### CTAS — Write Query Results to a pgaa Table
-
-```sql
-CREATE TABLE analytics.summary USING PGAA WITH (
-    pgaa.managed_by        = 'my_catalog',
-    pgaa.catalog_namespace = 'production',
-    pgaa.catalog_table     = 'summary',
-    pgaa.format            = 'iceberg',
-    pgaa.purge_data_if_exists = true    -- required if data already exists
-) AS SELECT region, SUM(amount) FROM orders GROUP BY region;
-```
-
-⚠ CTAS source queries **always use CompatScan** (never DirectScan) — this is
-expected behavior, not an error.
-
-### Convert an Existing Heap Table In-Place
-
-```sql
--- To pgaa (catalog-managed)
-ALTER TABLE public.my_table
-    SET ACCESS METHOD pgaa,
-    SET (
-        pgaa.auto_truncate     = 'true',
-        pgaa.format            = 'iceberg',
-        pgaa.managed_by        = 'my_catalog',
-        pgaa.catalog_namespace = 'public',
-        pgaa.catalog_table     = 'my_table'
-    );
-
--- Back to heap
-ALTER TABLE public.my_table SET ACCESS METHOD heap;
+-- Verify routing with EXPLAIN
+EXPLAIN SELECT COUNT(*) FROM analytics.events;
+-- Lakehouse/PGD:   SeafowlDirectScan  (fast, full pushdown)
+-- WarehousePG:     SeafowlCompatScan  (expected fallback on Greenplum)
+-- If no Seafowl node: pgaa is not active — check installation
 ```
 
 ---
 
-## 4. Execution Engines
+## Execution Engines
 
-### Seafowl (Default)
+pgaa supports two engines, controlled by `pgaa.executor_engine` (default: `seafowl`).
 
-Embedded DataFusion-based engine. Starts automatically as a background process.
-
-```sql
-SET pgaa.executor_engine = 'seafowl';      -- default; usually no change needed
-SHOW pgaa.autostart_seafowl;               -- should be 'on'
-SHOW pgaa.seafowl_url;                     -- default: http://localhost:47470
-```
-
-**Scan modes:**
-- **DirectScan** — full query offloaded to Seafowl via Arrow Flight (fast).
-- **CompatScan** — falls back to PostgreSQL executor (slower; always used for
-  CTAS source; normal on WarehousePG).
+| Engine | Type | Use Case | Writes? |
+|---|---|---|---|
+| `seafowl` | Embedded DataFusion | Default; no external dependencies; auto-started | Yes |
+| `spark_connect` | External Spark cluster | Heavy/complex workloads | No (read-only) |
 
 ```sql
-SET pgaa.enable_direct_scan = on;              -- default
-SET pgaa.direct_scan_fail_behavior = 'warn';   -- 'ignore' | 'warn' | 'error'
-SET pgaa.enable_join_pushdown   = on;          -- default
-SET pgaa.enable_groupby_pushdown = on;         -- default
-```
+-- Switch to Spark Connect
+SET pgaa.executor_engine = 'spark_connect';
+SET pgaa.spark_connect_url = 'sc://spark-host:15002';
 
-### Spark Connect (Heavy Workloads)
-
-External Spark cluster. **Read-only** — all writes must go through PostgreSQL.
-
-```sql
-SET pgaa.executor_engine    = 'spark_connect';
-SET pgaa.spark_connect_url  = 'sc://spark-host:15002';
-
--- Run raw Spark SQL (single catalog)
-SELECT pgaa.spark_sql('SELECT COUNT(*) FROM ns.events', 'my_catalog');
-
--- Run Spark SQL against multiple catalogs
-SELECT pgaa.spark_sql('SELECT * FROM c1.ns.a JOIN c2.ns.b ...', ARRAY['c1', 'c2']);
+-- Raw Spark SQL (single or multi-catalog)
+SELECT pgaa.spark_sql('SELECT * FROM ns.table', 'my_catalog');
+SELECT pgaa.spark_sql('SELECT a.*, b.* FROM cat1.ns.t1 a JOIN cat2.ns.t2 b ON a.id = b.id',
+                      ARRAY['cat1', 'cat2']);
+-- Returns JSON. Spark Connect is READ-ONLY; all writes go through PostgreSQL.
 ```
 
 ---
 
-## 5. Catalog Management
+## Catalog Management Operations
 
 ```sql
--- Add a catalog (validates connection before registering)
-SELECT pgaa.add_catalog('name', 'iceberg-rest', '{...}'::json);
-SELECT pgaa.add_catalog('name', 'iceberg-s3tables', '{"arn":"...","region":"..."}'::json);
+SELECT * FROM pgaa.list_catalogs();                            -- list all catalogs
+SELECT * FROM pgaa.list_catalog_tables('my_catalog', NULL);   -- list tables in catalog
 
--- Update credentials/options
-SELECT pgaa.update_catalog('name', '{"token":"new-token"}'::json);
+SELECT pgaa.import_catalog('my_catalog', 'namespace');        -- one-time import
+SELECT pgaa.attach_catalog('my_catalog');                     -- start continuous sync
+SELECT * FROM pgaa.detach_catalog('my_catalog', cascade := false);  -- stop sync
 
--- List and inspect
-SELECT * FROM pgaa.list_catalogs();
-SELECT * FROM pgaa.list_catalog_tables('my_catalog');
-
--- One-time import of all tables from a catalog namespace
-SELECT pgaa.import_catalog('my_catalog', 'production');
-
--- Continuous background sync (attach/detach)
-SELECT pgaa.attach_catalog('my_catalog');
-SELECT pgaa.detach_catalog('my_catalog', cascade := false);
-
--- Delete (cascade := true also drops managed tables)
-SELECT pgaa.delete_catalog('my_catalog', cascade := false);
-
--- Test connectivity (returns NULL on success, error string on failure)
-SELECT pgaa.test_catalog('my_catalog', false);
-SELECT pgaa.validate_catalog_connection('iceberg-rest', '{...}'::json);
+SELECT * FROM pgaa.update_catalog('my_catalog', '{"token": "<NEW>"}'::json);
+SELECT * FROM pgaa.delete_catalog('my_catalog', cascade := false);  -- cascade := true drops tables
+SELECT pgaa.test_catalog('my_catalog', test_writes := false);       -- NULL = success
 ```
-
-**S3 Tables limitation:** Iceberg S3 Tables catalogs do **not** support PGD
-replication, tiered tables, or analytics offload. Use an Iceberg REST catalog
-(e.g., Lakekeeper) for those features.
 
 ---
 
-## 6. PGD Integration (HTAP)
+## PGD → Iceberg Replication
 
-On a PGD cluster, pgaa enables automatic replication of transactional writes
-from heap tables to Iceberg.
+For full details: [references/pgd-tiered-tables-reference.md](references/pgd-tiered-tables-reference.md)
 
 ```sql
--- At table creation
+-- Create table with replication enabled
 CREATE TABLE app.orders (
-    order_id   SERIAL PRIMARY KEY,
-    amount     DECIMAL(10,2),
-    created_at TIMESTAMPTZ DEFAULT now()
+  order_id    SERIAL PRIMARY KEY,
+  customer_id INT NOT NULL,
+  amount      DECIMAL(10,2) NOT NULL,
+  created_at  TIMESTAMPTZ DEFAULT now()
 ) WITH (pgd.replicate_to_analytics = true);
 
--- Enable on an existing table (triggers FULL RELOAD — see gotcha below)
+-- Enable/disable on existing tables
 CALL pgaa.enable_analytics_replication('app.orders'::regclass);
--- OR: ALTER TABLE app.orders SET (pgd.replicate_to_analytics = true);
-
--- Disable
 CALL pgaa.disable_analytics_replication('app.orders'::regclass);
+```
 
--- Wait for replication to catch up (ONLY after all writes have stopped)
-SELECT bdr.wait_slot_confirm_lsn(bdr.local_analytics_slot_name(), NULL);
+> ⚠️ **Re-enabling replication triggers a full reload** — existing analytics data is
+> removed and current local data is re-uploaded. Plan for downtime on large tables.
 
--- Query via the analytics engine instead of heap
+```sql
+-- Query via analytics engine
 SET bdr.prefer_analytics_engine = true;
 SELECT * FROM app.orders WHERE created_at > '2024-01-01';
 
+-- Wait for replication (ONLY after all writes have stopped — blocks indefinitely otherwise)
+SELECT bdr.wait_slot_confirm_lsn(bdr.local_analytics_slot_name(), NULL);
+
 -- Monitor replication state
-SELECT schema_name, table_name, replication_status
-FROM pgaa.list_analytics_tables();
--- replication_status: 'disabled' | 'initial_offload' | 'enabled'
-
-SELECT * FROM bdr.analytics_table;
+SELECT schema_name, table_name, replication_status FROM pgaa.list_analytics_tables();
 ```
-
-⚠ **Full-reload gotcha:** Re-enabling replication removes all existing
-analytics data and re-uploads the current local table. This is intentional
-but destructive — warn users before triggering on large tables.
-
-⚠ **`bdr.wait_slot_confirm_lsn()` blocks indefinitely** if writes are still
-ongoing. Only call it after all writes to the table have stopped.
 
 ---
 
-## 7. Tiered Tables
+## Tiered Tables
 
-Tiered tables automatically age partitions from hot local heap storage into cold
-pgaa/Iceberg storage based on a configurable time threshold.
+Tiered tables partition data with hot (heap) and cold (pgaa/Iceberg) tiers, with
+automatic partition advancement and offload.
 
-**Prerequisites:** partition column must be DATE/TIMESTAMP and part of the
-primary key; no sequences or foreign keys on the table.
+**Constraints:** partition column must be `DATE`/`TIMESTAMP` and part of the primary key; no sequences or foreign key constraints on the table.
 
 ```sql
--- Create a suitable base table first
+-- Step 1: Create base table (no BIGSERIAL, no FK)
 CREATE TABLE app.events (
-    event_id   BIGSERIAL,
-    event_date DATE NOT NULL,
-    event_type TEXT,
-    PRIMARY KEY (event_id, event_date)   -- date must be in PK
+  event_id   BIGINT,
+  event_date DATE NOT NULL,
+  event_type TEXT NOT NULL,
+  PRIMARY KEY (event_id, event_date)   -- partition column in PK
 );
 
--- Convert to tiered
+-- Step 2: Convert to tiered
 CALL pgaa.convert_to_tiered_table(
-    relation                 := 'app.events'::regclass,
-    range_partition_column   := 'event_date',
-    partition_increment      := '1 month',
-    analytics_offload_period := '3 months',   -- data older than 3mo → cold
-    initial_lower_bound      := '2024-01-01',
-    retention_period         := '2 years',    -- purge after 2 years (optional)
-    enable_replication       := true          -- HTAP for hot partitions
+  relation               := 'app.events'::regclass,
+  range_partition_column := 'event_date',
+  partition_increment    := '1 month',
+  analytics_offload_period := '3 months',
+  initial_lower_bound    := '2024-01-01',
+  retention_period       := '2 years',
+  enable_replication     := true       -- HTAP for hot partitions
 );
 
 -- Monitor
 SELECT schema_name, table_name, analytics_offload, tiered_data_size, untiered_data_size
 FROM pgaa.list_tiered_tables();
-
--- Manually convert HTAP → cold
-CALL pgaa.convert_to_analytics('app.events'::regclass);
-
--- Restore cold → local heap (does NOT clean up object storage)
-CALL pgaa.restore_from_analytics('app.events'::regclass);
 ```
 
 ---
 
-## 8. Background Maintenance Tasks
+## Background Maintenance Tasks
 
-**Critical:** `pgaa.enable_maintenance_worker` defaults to `off`. Tasks will
-queue in `pgaa.background_task` but never execute unless this is enabled.
+> ⚠️ **`pgaa.enable_maintenance_worker` defaults to `off`** — tasks will queue but
+> not execute until this is enabled.
 
 ```sql
--- Enable the maintenance worker
 ALTER SYSTEM SET pgaa.enable_maintenance_worker = on;
 SELECT pg_reload_conf();
 
--- Schedule tasks
-SELECT pgaa.launch_task('analytics.events'::regclass, 'compaction', '{}');
+-- Schedule compaction (delta and iceberg)
+SELECT pgaa.launch_task('analytics.events'::regclass, 'compaction',
+  '{"target_size": 536870912, "dry_run": false}'::jsonb);
+
+-- Schedule Z-order (delta only; use pgaa.spark_sql() for Iceberg)
 SELECT pgaa.launch_task('analytics.events'::regclass, 'zorder',
-    '{"columns":["region","date"]}'::jsonb);  -- Delta only
+  '{"columns": ["customer_id", "event_date"]}'::jsonb);
+
+-- Schedule vacuum (delta only)
 SELECT pgaa.launch_task('analytics.events'::regclass, 'vacuum',
-    '{"retention_period":"168 hours"}'::jsonb);  -- Delta only
-SELECT pgaa.launch_task('analytics.events'::regclass, 'purge',
-    '{"storage_location":"my-store","path":"tmp/"}'::jsonb);  -- Delta only
+  '{"retention_period": "168 hours", "dry_run": false}'::jsonb);
 
 -- Check task status
-SELECT id, task_type, status, created_at, finished_at
-FROM pgaa.background_task ORDER BY created_at DESC LIMIT 20;
--- status: 'pending' | 'running' | 'success' | 'failure'
+SELECT id, task_type, status, scheduled_at, error
+FROM pgaa.background_task ORDER BY scheduled_at DESC LIMIT 20;
 ```
 
-**Iceberg note:** `launch_task` only supports `compaction` for Iceberg tables.
-For zorder/vacuum/purge on Iceberg, use `pgaa.spark_sql()` with the Spark
-Connect engine.
+**Iceberg maintenance note:** `launch_task` only supports `compaction` for Iceberg.
+Use `pgaa.spark_sql()` for `zorder`, `vacuum`, and `purge` on Iceberg tables.
+`pgaa.execute_compaction()` is deprecated; use `launch_task` instead.
 
-`pgaa.execute_compaction()` is deprecated — use `launch_task` instead.
-
-See [assets/quick-reference.md](assets/quick-reference.md) for full task
-option JSON schemas.
+For task scheduling and monitoring via Python: `Run scripts/pgaa_maintenance.py`
 
 ---
 
-## 9. Inspecting Tables and Storage
+## Inspection & Diagnostics
 
 ```sql
+-- All pgaa tables: format, replication status, sizes
+SELECT schema_name, table_name, format, replication_status,
+       pg_size_pretty(object_storage_snapshot_size_bytes) AS snapshot,
+       pg_size_pretty(object_storage_total_size_bytes) AS total
+FROM pgaa.list_analytics_tables();
+
+-- Storage sizes for a specific table
+SELECT * FROM pgaa.lakehouse_table_stats('analytics.events'::regclass);
+
 -- Version info
 SELECT pgaa.pgaa_version();
 SELECT pgaa.engine_version();
 
--- All pgaa tables
-SELECT schema_name, table_name, format, replication_status,
-       pg_size_pretty(object_storage_snapshot_size_bytes) AS snap_size
-FROM pgaa.list_analytics_tables();
+-- All pgaa GUC settings
+SELECT name, setting, unit FROM pg_settings WHERE name LIKE 'pgaa%' ORDER BY name;
 
--- Storage stats for a specific table
-SELECT * FROM pgaa.lakehouse_table_stats('analytics.events'::regclass);
-
--- Test connectivity
-SELECT pgaa.test_catalog('my_catalog', false);         -- NULL = OK
-SELECT pgaa.test_storage_location('my-store', false);  -- NULL = OK
+-- DataFusion overrides (non-default only)
+SELECT name, setting FROM pg_settings
+WHERE name LIKE 'pgaa.datafusion%' AND setting IS DISTINCT FROM boot_val;
 ```
 
-Run `scripts/pgaa_diagnose.sql` with `\i scripts/pgaa_diagnose.sql` for a
-full health snapshot.
+For a full diagnostic report across versions, catalogs, tables, tasks, and GUCs,
+run: `Run scripts/pgaa_inspect.py`
 
 ---
 
-## 10. Key Gotchas — Read Before Acting
+## Smoke Test
 
-| # | Gotcha | Action |
-|---|--------|--------|
-| 1 | `pgaa.enable_maintenance_worker` defaults to **`off`** | Set to `on` for `launch_task` to execute |
-| 2 | Re-enabling PGD replication triggers a **full reload** (analytics data wiped) | Warn user before calling; expect slowness on large tables |
-| 3 | `bdr.wait_slot_confirm_lsn()` **blocks indefinitely** if writes are ongoing | Only call after all writes are stopped |
-| 4 | `pgaa.restore_from_analytics()` does **not** clean up object storage files | Manual cloud-side cleanup required afterward |
-| 5 | S3 Tables catalogs do **not** support PGD, tiered tables, or offload | Use Iceberg REST catalog for those features |
-| 6 | CTAS source queries **always use CompatScan**, never DirectScan | Expected — not an error |
-| 7 | `launch_task` supports **only `compaction`** for Iceberg tables | Use `pgaa.spark_sql()` for other Iceberg maintenance |
-| 8 | Empty column list `()` in `CREATE TABLE` triggers **schema auto-discovery** | Intentional — not an error |
-| 9 | Schema evolution in the catalog is **not auto-applied** to Postgres | Manually `ALTER TABLE` to match upstream schema changes |
-| 10 | WarehousePG requires `pgaa` in **`shared_preload_libraries`** | Add on coordinator + all segment hosts, then restart |
-| 11 | CTAS fails if data exists at the target path | Add `pgaa.purge_data_if_exists = true` to `WITH` clause |
-| 12 | Deleting a pgfs storage location **does not delete bucket data** | Drop dependent PGAA tables first; clean bucket separately |
+Validate installation against the EDB TPC-H public demo bucket (no credentials needed):
+
+```sql
+CREATE SCHEMA IF NOT EXISTS smoke_test;
+SELECT pgfs.create_storage_location('smoke-data',
+  's3://beacon-analytics-demo-data-us-east-1-prod', '{"aws_skip_signature": "true"}');
+CREATE TABLE smoke_test.customer () USING PGAA WITH (
+  pgaa.storage_location = 'smoke-data', pgaa.path = 'tpch_sf_1/customer');
+SELECT COUNT(*) FROM smoke_test.customer;   -- expected: 150,000
+EXPLAIN SELECT COUNT(*) FROM smoke_test.customer;  -- expect SeafowlDirectScan / SeafowlCompatScan
+-- Cleanup (order: table → schema → storage location)
+DROP TABLE smoke_test.customer CASCADE;
+DROP SCHEMA smoke_test CASCADE;
+SELECT pgfs.delete_storage_location('smoke-data');
+```
+
+Or run the automated smoke test: `Run scripts/pgaa_smoke_test.py`
 
 ---
 
-## 11. Reference Files
+## Key Gotchas Summary
 
-| File | When to read |
-|------|-------------|
-| [references/function-reference.md](references/function-reference.md) | Full function signatures, GUC table, data-type mapping |
-| [references/troubleshooting.md](references/troubleshooting.md) | Symptom-based diagnosis for common errors and misconfigurations |
-| [references/deployment-contexts.md](references/deployment-contexts.md) | Per-context setup differences: Lakehouse, WarehousePG, PGD |
-| [references/pgfs-guide.md](references/pgfs-guide.md) | pgfs storage location management, credentials, cleanup rules |
-| [assets/quick-reference.md](assets/quick-reference.md) | Catalog option JSON schemas, table WITH options, GUC defaults, task option JSON |
-| [scripts/pgaa_diagnose.sql](scripts/pgaa_diagnose.sql) | Run against a live instance for a full health snapshot |
-| [scripts/pgaa_smoke_test.py](scripts/pgaa_smoke_test.py) | Automated smoke test using the public TPC-H SF1 Delta sample data |
+| Situation | Gotcha |
+|---|---|
+| WarehousePG install | `pgaa` must be in `shared_preload_libraries` — extension creation alone is not enough |
+| Maintenance tasks | `pgaa.enable_maintenance_worker` defaults to `off` — tasks queue silently |
+| Re-enabling PGD replication | Triggers a full reload — existing analytics data is wiped and re-uploaded |
+| `bdr.wait_slot_confirm_lsn()` | Blocks indefinitely if writes are ongoing — only call when writes are stopped |
+| CTAS overwrite | Fails unless `pgaa.purge_data_if_exists = true` |
+| Iceberg maintenance | `launch_task` only supports `compaction` for Iceberg; use `spark_sql()` for the rest |
+| Catalog cascade | `delete_catalog(cascade := false)` leaves dependent tables intact; use `cascade := true` to drop them |
+| `restore_from_analytics()` | Restores data to heap but does **not** delete files from object storage |
+| Schema evolution | Catalog-managed table schema changes require manual `ALTER TABLE` in Postgres |
+| S3 Tables + PGD | `iceberg-s3tables` catalogs do not support PGD replication, tiered tables, or offload |
+| Storage location cleanup | Delete pgaa tables **before** deleting their storage location; reverse order orphans the table |
+| Spark Connect | Read-only — all writes must go through PostgreSQL |
+
+---
+
+## Reference Files
+
+| File | Contents |
+|---|---|
+| [references/function-reference.md](references/function-reference.md) | Complete SQL function signatures, return columns, GUC tables, and enum types |
+| [references/pgfs-reference.md](references/pgfs-reference.md) | pgfs storage location management and smoke-test patterns |
+| [references/pgd-tiered-tables-reference.md](references/pgd-tiered-tables-reference.md) | PGD replication, tiered tables, convert/restore procedures |
+| [references/deployment-config-reference.md](references/deployment-config-reference.md) | Deployment contexts, all GUC parameters with defaults, data type mapping |
+| [references/troubleshooting-reference.md](references/troubleshooting-reference.md) | Error messages, debugging steps, common failure patterns |
+| [assets/sql-templates.md](assets/sql-templates.md) | Paste-ready SQL for every table creation, catalog, and maintenance pattern |
+| [scripts/pgaa_smoke_test.py](scripts/pgaa_smoke_test.py) | Automated smoke test against the public TPC-H demo bucket |
+| [scripts/pgaa_inspect.py](scripts/pgaa_inspect.py) | Diagnostic report: versions, catalogs, tables, tasks, GUCs |
+| [scripts/pgaa_maintenance.py](scripts/pgaa_maintenance.py) | Schedule, enable, and monitor background maintenance tasks |

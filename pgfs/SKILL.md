@@ -1,306 +1,326 @@
 ---
 name: pgfs
 description: >
-  Skill for operating the pgfs PostgreSQL extension, which provides SQL-level access to
-  object storage backends (AWS S3, Azure Blob Storage, Azure Data Lake Storage Gen2,
-  Google Cloud Storage, local filesystem, and in-memory) via foreign data wrappers.
-  Trigger this skill when a user asks to install pgfs, create or manage storage locations,
-  create or query foreign tables over object stores, read or write object content, configure
-  pgfs GUC parameters, or troubleshoot pgfs operations. Also applies when configuring storage
-  locations for downstream EDB extensions such as pgaa (EDB Postgres Analytics Accelerator)
-  that require pgfs as a dependency.
+  Skill for operating pgfs, an EDB PostgreSQL extension (Rust/pgrx) that exposes
+  filesystem-like object storage — AWS S3, Azure Blob Storage, Azure Data Lake Storage Gen2,
+  Google Cloud Storage, local filesystem, and in-memory — via PostgreSQL foreign data wrappers.
+  Trigger this skill whenever a user needs to: install pgfs; create, update, list, or delete
+  storage locations (named foreign servers) or their associated foreign tables; read, upload,
+  update, or delete objects stored in cloud/local buckets through SQL DML; configure
+  pgfs GUC parameters; or understand the body-on-demand, LIMIT pushdown, and
+  non-transactional semantics of pgfs foreign tables. Also applies when configuring
+  storage locations consumed by dependent extensions such as pgaa (EDB Postgres Analytics
+  Accelerator), which requires pgfs as its storage layer.
 metadata:
-  version: "3.2.1"
-  language: SQL / Rust (pgrx)
-  postgres_versions: "PG14+ (full DML); PG12/13 noop handler only"
-  backends: "s3://, az://, abfss://, gs://, file://, memory://"
-  references:
-    - references/function-reference.md
-    - references/egress-and-security.md
-    - assets/storage-location-templates.md
-  scripts:
-    - scripts/pgfs_diagnose.py
+  aliases: [pgfs]
+  extension_schema: pgfs
+  install_command: "CREATE EXTENSION pgfs CASCADE"
+  superuser_required: true
+  source_repo: https://github.com/EnterpriseDB/pgfs.git
+  docs: https://www.enterprisedb.com/docs/pg_extensions/pgfs/
 ---
 
 # pgfs Agent Skill
 
-## Overview
+pgfs gives PostgreSQL SQL-level access to object storage through foreign data wrappers.
+Two primitives cover all usage: **storage locations** (named foreign servers, configured once)
+and **foreign tables** (SQL tables that list and access objects in a location).
 
-pgfs is a PostgreSQL extension (built in Rust/pgrx) that exposes object storage as
-**foreign tables** with full DML support. The agent can use this skill to:
+## Quick Reference
 
-1. Install the extension
-2. Create and manage **storage locations** (named foreign servers pointing at buckets/containers)
-3. Create **foreign tables** over those locations
-4. Read object metadata and content via `SELECT`
-5. Upload, overwrite, and delete objects via `INSERT`, `UPDATE`, `DELETE`
-6. Configure GUC parameters (egress, local filesystem allowlists)
-7. Diagnose problems
-
-See [references/function-reference.md](references/function-reference.md) for full function signatures.
-See [assets/storage-location-templates.md](assets/storage-location-templates.md) for copy-paste SQL templates per backend.
-See [references/egress-and-security.md](references/egress-and-security.md) for security configuration details.
+- Full SQL templates → [assets/pgfs_sql_templates.sql](assets/pgfs_sql_templates.sql)
+- All function signatures → [references/function-reference.md](references/function-reference.md)
+- Credential setup per backend → [references/credentials-guide.md](references/credentials-guide.md)
+- Diagnostic script (Python) → [scripts/pgfs_diagnostics.py](scripts/pgfs_diagnostics.py)
 
 ---
 
-## Step 1 — Install the Extension
+## 1. Installation
 
 ```sql
 CREATE EXTENSION pgfs CASCADE;
 ```
 
-- Requires **superuser**.
-- `CASCADE` installs the `pgfs_fdw` foreign data wrapper automatically.
-- The extension schema is `pgfs`; all functions are in that schema.
+Requires superuser. `CASCADE` installs any prerequisite extensions automatically.
+Verify: `SELECT pgfs.pgfs_version();`
 
 ---
 
-## Step 2 — Create a Storage Location
+## 2. Supported Backends
 
-A storage location is a named foreign server. Create it once; reference it everywhere.
+| Backend | URL scheme |
+|---|---|
+| AWS S3 | `s3://bucket` |
+| Azure Blob Storage | `az://container` |
+| Azure Data Lake Storage Gen2 | `abfss://<container>@<account>.dfs.core.windows.net/<path>` |
+| Google Cloud Storage | `gs://bucket` |
+| Local filesystem | `file:///absolute/path` |
+| In-memory (testing only) | `memory://` |
+
+---
+
+## 3. Creating a Storage Location
+
+A storage location is a named pointer to a bucket/container. Create it once; reference it everywhere.
 
 ```sql
+-- Minimum form (name + URL)
+SELECT pgfs.create_storage_location('my_s3', 's3://my-bucket-name');
+
+-- With region option and static credentials
 SELECT pgfs.create_storage_location(
-    name        => 'my_bucket',
-    url         => 's3://my-bucket-name',
+    'my_s3',
+    's3://my-bucket-name',
+    options     => '{"region": "us-east-1"}',
+    credentials => '{"access_key_id": "AKIA...", "secret_access_key": "..."}'
+);
+
+-- One-shot: create storage location AND a foreign table named my_s3_ft
+SELECT pgfs.create_storage_location_with_foreign_table(
+    'my_s3',
+    's3://my-bucket-name',
     options     => '{"region": "us-east-1"}',
     credentials => '{"access_key_id": "AKIA...", "secret_access_key": "..."}'
 );
 ```
 
-**Or create location + foreign table in one call** (auto-names table `<name>_ft`):
+For secrets that must not be persisted in the catalog, use `credentials_env`:
 
 ```sql
-SELECT pgfs.create_storage_location_with_foreign_table(
-    'my_bucket', 's3://my-bucket-name',
-    options     => '{"region": "us-east-1"}',
-    credentials => '{"access_key_id": "...", "secret_access_key": "..."}'
+-- Only the env var NAME is stored; the secret is resolved at use time
+SELECT pgfs.create_storage_location(
+    'my_s3',
+    's3://my-bucket-name',
+    options         => '{"region": "us-east-1"}',
+    credentials     => NULL,
+    credentials_env => 'PGFS_S3_CREDS'   -- must start with PGFS_ by default
 );
--- Creates foreign table: my_bucket_ft
 ```
 
-### URL Schemes by Backend
-
-| Backend | URL Format |
-|---|---|
-| AWS S3 | `s3://bucket-name` |
-| Azure Blob Storage | `az://container-name` |
-| Azure Data Lake Gen2 | `abfss://container@account.dfs.core.windows.net/path` |
-| Google Cloud Storage | `gs://bucket-name` |
-| Local filesystem | `file:///absolute/path` |
-| In-memory (testing) | `memory://` |
-
-For backend-specific credential fields, see [assets/storage-location-templates.md](assets/storage-location-templates.md).
+See [references/credentials-guide.md](references/credentials-guide.md) for per-backend
+credential keys and `credentials_env` security rules.
 
 ---
 
-## Step 3 — Create a Foreign Table
+## 4. Creating a Foreign Table
 
 ```sql
--- Over the whole bucket (root path):
-SELECT pgfs.create_foreign_table('my_files', 'my_bucket');
+-- Simple (path defaults to '/')
+SELECT pgfs.create_foreign_table('my_files', 'my_s3');
 
--- Over a sub-path prefix:
-SELECT pgfs.create_foreign_table('my_reports', 'my_bucket', '/reports/2024/');
+-- Scoped to a sub-path
+SELECT pgfs.create_foreign_table('my_files', 'my_s3', '/data/2024/');
 
--- Schema-qualified:
-SELECT pgfs.create_foreign_table('myschema.my_files', 'my_bucket', '/data/');
+-- Schema-qualified table name
+SELECT pgfs.create_foreign_table('analytics.raw_files', 'my_s3', '/raw/');
 ```
 
-Every foreign table has this fixed schema:
+Every foreign table created by pgfs has this **fixed schema**:
 
 | Column | Type | Description |
 |---|---|---|
 | `key` | `TEXT` | Object path/name, relative to the storage location |
 | `size` | `BIGINT` | Object size in bytes |
 | `last_modified` | `TIMESTAMPTZ` | Last modification timestamp |
-| `e_tag` | `TEXT` | ETag (version hash), if available |
-| `body` | `BYTEA` | Object content — **lazy loaded** (see below) |
+| `e_tag` | `TEXT` | Object ETag (version hash), if available |
+| `body` | `BYTEA` | Object content — **lazy; only populated with a `WHERE key = '...'` filter** |
 
 ---
 
-## Step 4 — Query and Modify Objects
+## 5. Using a Foreign Table
 
-### Listing objects (no body download)
+### Listing objects
 
 ```sql
+-- body is NULL for all rows without a key filter — this is intentional
 SELECT key, size, last_modified, e_tag FROM my_files;
-SELECT key, size FROM my_files LIMIT 50;
+
+-- Bounded listing for large buckets (LIMIT pushdown applies to simple queries)
+SELECT key, size FROM my_files LIMIT 100;
 ```
 
-### Reading a single object's content
+### Reading object content
 
 ```sql
--- body is only populated when a WHERE key = '...' filter is present:
-SELECT body FROM my_files WHERE key = 'path/to/file.txt';
+-- body is populated ONLY when both: (a) selected, (b) WHERE key = '...' filter present
+SELECT key, convert_from(body, 'UTF8') AS content
+FROM my_files
+WHERE key = 'readme.txt';
 
--- Decode as text:
-SELECT convert_from(body, 'UTF8') FROM my_files WHERE key = 'readme.md';
+-- Raw bytes
+SELECT body FROM my_files WHERE key = 'data/file.bin';
 ```
 
 ### Uploading (INSERT)
 
 ```sql
-INSERT INTO my_files (key, body) VALUES ('hello.txt', 'Hello, World!'::bytea);
+INSERT INTO my_files (key, body)
+VALUES ('hello.txt', 'Hello, world!'::bytea);
+
+-- Empty object
+INSERT INTO my_files (key) VALUES ('empty.txt');
 ```
 
-### Overwriting content (UPDATE)
+### Updating object content
 
 ```sql
-UPDATE my_files SET body = 'Updated'::bytea WHERE key = 'hello.txt';
--- Cannot change key via UPDATE — use DELETE + INSERT to rename.
+-- Update content — OK
+UPDATE my_files SET body = 'Updated content'::bytea WHERE key = 'hello.txt';
+
+-- ⚠️ Renaming via UPDATE is REJECTED — use DELETE + INSERT instead
+DELETE FROM my_files WHERE key = 'old-name.txt';
+INSERT INTO my_files (key, body) VALUES ('new-name.txt', <body_value>);
 ```
 
-### Deleting (DELETE)
+### Deleting objects
 
 ```sql
 DELETE FROM my_files WHERE key = 'hello.txt';
 ```
 
-### Renaming an object
-
-```sql
--- No atomic rename — use DELETE + INSERT:
-INSERT INTO my_files (key, body)
-  SELECT 'new/path.txt', body FROM my_files WHERE key = 'old/path.txt';
-DELETE FROM my_files WHERE key = 'old/path.txt';
-```
-
 ---
 
-## Step 5 — Manage Storage Locations
+## 6. Managing Storage Locations
 
 ```sql
--- List all (credentials masked):
+-- List all (credential values are masked — use get_storage_location for real values)
 SELECT * FROM pgfs.list_storage_locations();
 
--- Get one with real credentials:
-SELECT * FROM pgfs.get_storage_location('my_bucket');
+-- Inspect one location with real credential values
+SELECT * FROM pgfs.get_storage_location('my_s3');
 
--- Update (replaces server + user mapping):
-SELECT pgfs.update_storage_location('my_bucket', 's3://new-bucket',
-    options => '{"region": "us-west-2"}',
+-- Update (delete-and-recreate; supply full new configuration)
+SELECT pgfs.update_storage_location(
+    'my_s3', 's3://new-bucket',
+    options     => '{"region": "eu-west-1"}',
     credentials => '{"access_key_id": "...", "secret_access_key": "..."}'
 );
 
--- Delete (does NOT drop associated foreign tables):
-SELECT pgfs.delete_storage_location('my_bucket');
+-- Delete (does NOT auto-drop associated foreign tables)
+SELECT pgfs.delete_storage_location('my_s3');
 
--- Default location management:
-SELECT pgfs.set_default_storage_location('my_bucket');
+-- Default storage location (used by dependent tools like pgaa)
+SELECT pgfs.set_default_storage_location('my_s3');
 SELECT * FROM pgfs.get_default_storage_location();
 ```
 
 ---
 
-## Step 6 — Configure GUC Parameters
-
-### Local filesystem allowlist (required before using `file://`)
+## 7. Introspection Views
 
 ```sql
--- Set in session (superuser only):
-SET pgfs.allowed_local_fs_paths = '/data/shared:/tmp/pgfs';
-
--- Or permanently in postgresql.conf:
--- pgfs.allowed_local_fs_paths = '/data/shared'
+SELECT * FROM pgfs.v_server_options;         -- all server-level options per storage location
+SELECT * FROM pgfs.v_foreign_tables;         -- all pgfs foreign tables
+SELECT * FROM pgfs.v_foreign_table_options;  -- all foreign table options
 ```
-
-Default: `/tmp/pgfs`. Empty string = deny all local paths.
-
-### Egress allowlist (optional, limits outbound connections)
-
-```ini
-# postgresql.conf
-pgfs.egress_allowlist = '.s3.amazonaws.com,.storage.googleapis.com'
-edb.egress_allowlist  = '.amazonaws.com,.googleapis.com,.core.windows.net'
-```
-
-See [references/egress-and-security.md](references/egress-and-security.md) for full details.
 
 ---
 
-## Critical Constraints the Agent Must Enforce
+## 8. GUC Configuration
 
-1. **Non-transactional writes**: INSERT/UPDATE/DELETE on foreign tables **cannot be rolled back**. Successful object store writes persist even if the PostgreSQL transaction aborts. Warn users before DML in transaction blocks where rollback might be expected.
+| GUC | Default | Description |
+|---|---|---|
+| `pgfs.allowed_local_fs_paths` | `/tmp/pgfs` | Colon-separated allowed local path prefixes for `file://` backend |
+| `pgfs.env_var_allowed_prefix` | `PGFS_` | Colon-separated required prefixes for `credentials_env` env var names |
+| `pgfs.egress_allowlist` | (unset) | pgfs-only egress allowlist (overrides `edb.egress_allowlist` when set) |
+| `edb.egress_allowlist` | (unset) | Shared EDB egress allowlist default for pgfs and other EDB extensions |
 
-2. **UPDATE cannot rename objects**: Changing the `key` column in an UPDATE is rejected with an error. Always guide users to DELETE + INSERT for renames.
+```sql
+-- Allow multiple local paths
+SET pgfs.allowed_local_fs_paths = '/tmp/pgfs:/data/shared';
 
-3. **`body` is lazy**: `SELECT *` or `SELECT body` without `WHERE key = '...'` returns NULL for `body`. Only a plain equality filter on `key` triggers a content fetch.
-
-4. **LIMIT pushdown only for simple queries**: LIMIT is pushed down to the object store scan only for queries without `ORDER BY`, `GROUP BY`, `DISTINCT`, aggregates, window functions, or set operations. For complex queries, all objects may be fetched before LIMIT applies.
-
-5. **Local filesystem path restriction**: `file://` locations outside the `pgfs.allowed_local_fs_paths` allowlist are rejected. The GUC must be set (superuser) before creating such locations.
-
-6. **PG12/PG13 limitation**: On PG12 and PG13 (including WHPG), pgfs installs a noop FDW handler that returns 0 rows and does not support DML. Full functionality requires PG14+.
-
-7. **`delete_storage_location` does not drop foreign tables**: Foreign tables built on a deleted storage location will error at query time. Drop them manually with `DROP FOREIGN TABLE`.
-
-8. **`options` and `credentials` keys must not contain `=`**: Option keys containing `=` are rejected by the storage location creation functions (catalog storage format conflict).
+-- Persist (requires superuser + reload)
+ALTER SYSTEM SET pgfs.allowed_local_fs_paths = '/tmp/pgfs:/data/shared';
+SELECT pg_reload_conf();
+```
 
 ---
 
-## Diagnostic Workflow
+## 9. Key Constraints and Gotchas
 
-When a user reports issues, run the diagnostic script or execute these queries manually:
+| Rule | Detail |
+|---|---|
+| **Non-transactional DML** | INSERT/UPDATE/DELETE that succeed on the object store **cannot be rolled back** if the surrounding PostgreSQL transaction aborts. |
+| **UPDATE cannot rename** | Setting `key` in an UPDATE is rejected. Rename = DELETE old key + INSERT new key. |
+| **body is lazy** | `body` is NULL unless the query both selects it *and* filters `WHERE key = '...'`. A plain `SELECT *` leaves `body` NULL for every row. |
+| **LIMIT pushdown is conditional** | LIMIT is pushed down only for simple scans — no ORDER BY, DISTINCT, aggregates, window functions, set operations, joins, non-constant OFFSET, or SRFs in the target list. |
+| **Local path allowlist** | `file://` backend rejects any path not under a prefix listed in `pgfs.allowed_local_fs_paths`. Default is `/tmp/pgfs`. |
+| **credentials_env mutual exclusion** | `credentials` and `credentials_env` cannot both be provided. An explicit `'{}'` for `credentials` still counts — it must be `NULL` to use `credentials_env`. |
+| **credentials_env env var prefix** | The env var name must start with a prefix from `pgfs.env_var_allowed_prefix` (default `PGFS_`). Set to `''` to disable. |
+| **delete_storage_location is not CASCADE for FTs** | Deleting a storage location does NOT drop its foreign tables. Drop them manually first if needed. |
+| **Pagination** | Full scans fetch objects 1000 at a time for bounded memory use. |
+
+---
+
+## 10. Common Patterns
+
+### Check if pgfs is installed
 
 ```sql
--- 1. Confirm extension is installed:
 SELECT extversion FROM pg_extension WHERE extname = 'pgfs';
-
--- 2. List storage locations:
-SELECT * FROM pgfs.list_storage_locations();
-
--- 3. List foreign tables:
-SELECT * FROM pgfs.v_foreign_tables;
-
--- 4. Check GUCs:
-SHOW pgfs.allowed_local_fs_paths;
-
--- 5. Test a storage location (should return rows if bucket is non-empty):
-SELECT key, size FROM <foreign_table_name> LIMIT 5;
 ```
 
-Or run the diagnostic script (requires `psycopg2`):
+### Full setup: S3 bucket with foreign table
+
+```sql
+CREATE EXTENSION pgfs CASCADE;
+
+SELECT pgfs.create_storage_location_with_foreign_table(
+    'prod_data',
+    's3://my-prod-bucket',
+    options     => '{"region": "us-east-1"}',
+    credentials => '{"access_key_id": "AKIA...", "secret_access_key": "..."}'
+);
+
+-- prod_data_ft is now available
+SELECT key, size FROM prod_data_ft LIMIT 50;
+SELECT convert_from(body, 'UTF8') FROM prod_data_ft WHERE key = 'config/settings.json';
+```
+
+### Copy-write a transformed object
+
+```sql
+-- Read, transform in SQL, write back
+INSERT INTO my_files (key, body)
+SELECT
+    'processed/' || key,
+    convert_to(upper(convert_from(body, 'UTF8')), 'UTF8')
+FROM my_files
+WHERE key = 'raw/input.txt';
+```
+
+### Local filesystem testing
+
+```sql
+SET pgfs.allowed_local_fs_paths = '/tmp/pgfs';
+
+SELECT pgfs.create_storage_location('local_test', 'file:///tmp/pgfs');
+SELECT pgfs.create_foreign_table('local_ft', 'local_test');
+
+INSERT INTO local_ft (key, body) VALUES ('test.txt', 'hello'::bytea);
+SELECT key, convert_from(body, 'UTF8') FROM local_ft WHERE key = 'test.txt';
+```
+
+### pgaa integration note
+
+pgfs is a required dependency of pgaa (EDB Postgres Analytics Accelerator). When helping a
+user configure pgaa, the storage location must be created via pgfs first. Do not re-explain
+pgfs's SQL surface from within pgaa context — refer here instead.
+
+---
+
+## 11. Diagnostics
+
+Run the diagnostic script to verify extension install, list all storage locations, and show
+all foreign tables:
 
 ```bash
-PGFS_DSN="host=localhost dbname=mydb user=postgres" python3 scripts/pgfs_diagnose.py
+python3 scripts/pgfs_diagnostics.py --dsn "host=localhost dbname=mydb user=postgres"
 ```
 
-See [scripts/pgfs_diagnose.py](scripts/pgfs_diagnose.py).
-
----
-
-## Common Error Patterns
-
-| Error | Likely Cause | Resolution |
-|---|---|---|
-| `extension "pgfs" does not exist` | Not installed | `CREATE EXTENSION pgfs CASCADE;` |
-| `permission denied` on `create_storage_location` | Not superuser | Requires superuser role |
-| `body` column is NULL | No `WHERE key = '...'` filter | Add exact key filter to query |
-| `Cannot rename objects via UPDATE` | Tried to change `key` in UPDATE | Use DELETE + INSERT |
-| `path ... not allowed` (file backend) | Path outside allowlist | Set `pgfs.allowed_local_fs_paths` |
-| `server "x" already exists` | Duplicate location name | Use unique name or `delete_storage_location` first |
-| `storage location "x" does not exist` | Bad name or already deleted | Verify with `list_storage_locations()` |
-| Credential error from cloud provider | Wrong credentials or permissions | Check `get_storage_location()` for real credential values |
-| `0 rows` on PG12/PG13 | Noop FDW on unsupported PG version | Upgrade to PG14+ for full support |
-
----
-
-## Relationship to pgaa (EDB Postgres Analytics Accelerator)
-
-pgfs is a **required dependency** of pgaa (`pgaa.control: requires = 'pgfs'`). When setting up pgaa analytics tables, pgfs storage locations define where raw data lives. Configure pgfs first, then reference the storage location name when creating pgaa tables. Do not re-explain pgfs's SQL surface when documenting pgaa — treat pgfs as the storage layer underneath it.
-
----
-
-## Views Available for Inspection
-
+Or run inline SQL:
 ```sql
--- All server-level options for pgfs storage locations:
-SELECT * FROM pgfs.v_server_options;
-
--- All foreign tables backed by pgfs:
-SELECT * FROM pgfs.v_foreign_tables;
-
--- Per-option breakdown of foreign table OPTIONS:
-SELECT * FROM pgfs.v_foreign_table_options;
+SELECT pgfs.pgfs_version();
+SELECT name, url, options::text FROM pgfs.list_storage_locations();
+SELECT schema_name, server_name, ft_name FROM pgfs.v_foreign_tables;
 ```
