@@ -2,16 +2,6 @@
 
 Distribution registry for compiled EDB Agent Skill artifacts. Skills published here are consumed by customer-deployed agentic systems (e.g., Claude) to interact with EDB products.
 
-This repository is one of three in the Agent Skills pipeline:
-
-| Repository | Role |
-|---|---|
-| `agent-config` | Defines project metadata and assembly parameters |
-| `agent-pipeline` | Executes the CI/CD skill assembly process |
-| `agent-skills` *(this repo)* | Distributes compiled skill artifacts to agentic systems |
-
-The assembly pipeline reads configuration from `agent-config`, generates skill artifacts, and publishes them here. Versions are tagged to align with the current Hybrid Manager release.
-
 ## Directory Structure
 
 ```
